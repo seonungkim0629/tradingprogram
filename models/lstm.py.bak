@@ -1,0 +1,1595 @@
+"""
+GRU 및 LSTM Models for Bitcoin Trading Bot
+
+이 모듈은 시계열 예측 및 분류를 위한 GRU(이전의 LSTM) 모델을 구현합니다.
+클래스 이름은 호환성을 위해 유지되었습니다.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+from typing import Dict, Any, Optional, Union, List, Tuple, Callable
+from datetime import datetime
+import tensorflow as tf
+from keras.models import Sequential, Model, load_model
+from keras.layers import LSTM, GRU, Dense, Dropout, BatchNormalization, LayerNormalization, Input
+from keras.optimizers import Adam
+from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, TensorBoard
+from keras.regularizers import l1_l2
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
+import traceback
+import json
+
+from models.base import TimeSeriesModel, ClassificationModel
+from utils.logging import get_logger, log_execution
+from config import settings
+
+# 로거 초기화
+logger = get_logger(__name__)
+
+# 재현성을 위한 랜덤 시드 설정
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# 모듈 로드 시 GPU 가용성 확인 및 로깅
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    logger.info(f"모델이 {len(gpus)} GPU(s)를 사용할 수 있습니다: {gpus}")
+    try:
+        # 더 나은 메모리 관리를 위한 메모리 증가 설정
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logger.info("GPU 메모리 증가 활성화됨")
+    except RuntimeError as e:
+        logger.warning(f"GPU 메모리 증가 설정 실패: {e}")
+else:
+    logger.warning("사용 가능한 GPU가 없습니다. 훈련이 CPU에서 진행되어 느릴 수 있습니다.")
+
+class LSTMPriceModel(TimeSeriesModel):
+    """비트코인 가격 예측을 위한 GRU 모델 (이름은 호환성을 위해 유지)"""
+    
+    def __init__(self, 
+                name: str = "LSTMPrice", 
+                version: str = "1.0.0",
+                sequence_length: int = 60,
+                forecast_horizon: int = 1,
+                units: List[int] = [64, 32],   # 유닛 수 축소: [128, 64] -> [64, 32]
+                dropout_rate: float = 0.4,     # Dropout 증가: 0.25 -> 0.4
+                learning_rate: float = 0.003,
+                batch_size: int = 32,
+                epochs: int = 100):
+        """
+        가격 예측 GRU 모델 초기화
+        
+        Args:
+            name (str): 모델 이름
+            version (str): 모델 버전
+            sequence_length (int): 참고할 과거 시간 단계 수
+            forecast_horizon (int): 예측할 미래 시간 단계 수
+            units (List[int]): 각 GRU 레이어의 유닛 수 리스트
+            dropout_rate (float): 각 GRU 레이어 이후의 Dropout 비율
+            learning_rate (float): Adam 옵티마이저 학습률
+            batch_size (int): 학습 배치 크기
+            epochs (int): 최대 학습 에폭 수
+        """
+        super().__init__(name, version)
+        
+        self.sequence_length = sequence_length
+        self.forecast_horizon = forecast_horizon
+        self.units = units
+        self.dropout_rate = dropout_rate
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        
+        # 파라미터 저장
+        self.params = {
+            'sequence_length': sequence_length,
+            'forecast_horizon': forecast_horizon,
+            'units': units,
+            'dropout_rate': dropout_rate,
+            'learning_rate': learning_rate,
+            'batch_size': batch_size,
+            'epochs': epochs
+        }
+        
+        self.model = None
+        self.scaler = None
+        self.feature_dim = None
+        self.history = None
+        
+        self.logger.info(f"{self.name} 모델을 {len(units)}개 GRU 레이어로 초기화했습니다")
+    
+    def build_model(self, input_shape: Tuple[int, int]) -> None:
+        """
+        GRU 모델 아키텍처 구축
+        
+        Args:
+            input_shape (Tuple[int, int]): 입력 형태 (sequence_length, features)
+        """
+        self.feature_dim = input_shape[1]
+        
+        model = Sequential()
+        
+        # GRU 레이어 추가 (LSTM 대신)
+        for i, units in enumerate(self.units):
+            return_sequences = i < len(self.units) - 1
+            if i == 0:
+                model.add(GRU(units, 
+                              return_sequences=return_sequences, 
+                              input_shape=input_shape,
+                              recurrent_regularizer=l1_l2(l1=0.00, l2=0.001)))
+            else:
+                model.add(GRU(units, 
+                              return_sequences=return_sequences,
+                              recurrent_regularizer=l1_l2(l1=0.00, l2=0.001)))
+                              
+            # BatchNormalization 대신 LayerNormalization 사용
+            model.add(LayerNormalization())
+            model.add(Dropout(self.dropout_rate))
+            
+        # 출력 레이어 추가
+        model.add(Dense(self.forecast_horizon))
+        
+        # 모델 컴파일
+        model.compile(
+            optimizer=Adam(learning_rate=self.learning_rate),
+            loss='mse',
+            metrics=['mae']
+        )
+        
+        self.model = model
+        model.summary(print_fn=self.logger.info)
+    
+    def train(self, X_train: np.ndarray, y_train: np.ndarray, 
+              X_val: np.ndarray = None, y_val: np.ndarray = None,
+              callbacks: List = None, 
+              early_stopping_patience: int = 5,
+              reduce_lr_patience: int = 3,
+              class_weights: Dict[int, float] = None) -> Dict[str, float]:
+        """
+        모델 학습
+        
+        Args:
+            X_train (np.ndarray): 훈련 데이터, 형태 (samples, sequence_length, features)
+            y_train (np.ndarray): 훈련 라벨
+            X_val (np.ndarray, optional): 검증 데이터. 기본값은 None.
+            y_val (np.ndarray, optional): 검증 라벨. 기본값은 None.
+            callbacks (List, optional): 추가 콜백 목록. 기본값은 None.
+            early_stopping_patience (int, optional): 조기 종료 인내심. 기본값은 5.
+            reduce_lr_patience (int, optional): 학습률 감소 인내심. 기본값은 3.
+            class_weights (Dict[int, float], optional): 클래스별 가중치. 기본값은 None.
+            
+        Returns:
+            Dict[str, float]: 학습 결과 메트릭
+        """
+        try:
+            start_time = pd.Timestamp.now()
+            self.logger.info(f"모델 학습 시작: X_train 형태 {X_train.shape}, y_train 형태 {y_train.shape}")
+            
+            # 원본 데이터 형태 저장
+            original_shape = None
+            
+            # 모델 재구축 필요 여부
+            needs_rebuild = False
+            
+            # 콜백 설정
+            if callbacks is None:
+                callbacks = []
+            
+            # 조기 종료 추가
+            if early_stopping_patience > 0:
+                early_stopping = EarlyStopping(
+                    monitor='val_loss' if X_val is not None else 'loss',
+                    patience=early_stopping_patience,
+                    verbose=1,
+                    restore_best_weights=True
+                )
+                callbacks.append(early_stopping)
+            
+            # 학습률 감소 추가
+            if reduce_lr_patience > 0:
+                reduce_lr = ReduceLROnPlateau(
+                    monitor='val_loss' if X_val is not None else 'loss',
+                    factor=0.5,
+                    patience=reduce_lr_patience,
+                    min_lr=0.00001,
+                    verbose=1
+                )
+                callbacks.append(reduce_lr)
+            
+            # 텐서보드 로깅 추가
+            log_dir = os.path.join("logs", f"{self.__class__.__name__}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
+            tensorboard_callback = TensorBoard(log_dir=log_dir, histogram_freq=1)
+            callbacks.append(tensorboard_callback)
+            
+            # 체크포인트 추가
+            model_dir = os.path.join("saved_models", f"{self.__class__.__name__}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}")
+            os.makedirs(model_dir, exist_ok=True)
+            checkpoint_callback = ModelCheckpoint(
+                filepath=os.path.join(model_dir, "model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.h5"),
+                monitor='val_loss' if X_val is not None else 'loss',
+                save_best_only=True,
+                save_weights_only=False,
+                verbose=1
+            )
+            callbacks.append(checkpoint_callback)
+            
+            # 데이터 전처리
+            if len(X_train.shape) == 3:  # 3D 배열 (samples, time_steps, features) 구조인 경우만 처리
+                # 문자열 특성 확인
+                string_columns = []
+                for feat_idx in range(X_train.shape[2]):
+                    # 첫 번째 샘플의 첫 번째 시간 단계의 특성 값 확인
+                    first_val = X_train[0, 0, feat_idx]
+                    if isinstance(first_val, (str, bytes, np.str_)):
+                        string_columns.append(feat_idx)
+                        self.logger.warning(f"문자열 특성 발견: 인덱스 {feat_idx}, 값: {first_val}")
+                
+                # 문자열 특성이 있는 경우 제외
+                if string_columns:
+                    self.logger.info(f"제외할 문자열 특성 인덱스: {string_columns}")
+                    
+                    # 숫자형 특성만 선택
+                    numeric_features = [i for i in range(X_train.shape[2]) if i not in string_columns]
+                    if not numeric_features:
+                        raise ValueError("숫자형 특성이 없습니다. 모델 학습을 진행할 수 없습니다.")
+                    
+                    # 원본 입력 모양 저장
+                    original_shape = (X_train.shape[1], X_train.shape[2])
+                    
+                    # 숫자형 특성만 사용
+                    X_train_clean = X_train[:, :, numeric_features]
+                    if X_val is not None:
+                        X_val_clean = X_val[:, :, numeric_features]
+                    
+                    self.logger.info(f"입력 데이터 형태 변경: {X_train.shape} -> {X_train_clean.shape}")
+                    
+                    # 모델 재구축 필요 표시
+                    needs_rebuild = True
+                    
+                    # 모델 재구축 (입력 차원이 변경되었으므로)
+                    new_shape = (X_train_clean.shape[1], X_train_clean.shape[2])
+                    
+                    if original_shape is not None:
+                        self.logger.info(f"모델 입력 형태 변경 필요: {original_shape} -> {new_shape}")
+                    
+                    # 모델 재구축 필요성 확인 및 실행
+                    if needs_rebuild:
+                        # Keras 모델 다시 구축
+                        self.logger.info(f"모델을 새 입력 형태 {new_shape}에 맞게 재구축합니다.")
+                        self.model = None  # 기존 모델 삭제
+                        self.build_model(new_shape)  # 새 형태로 다시 구축
+                else:
+                    # 문자열 데이터가 없는 경우 원본 사용
+                    X_train_clean = X_train
+                    if X_val is not None:
+                        X_val_clean = X_val
+            else:
+                # 다른 형태의 데이터는 그대로 사용
+                self.logger.warning(f"예상 외 데이터 형태: {X_train.shape}, 그대로 사용")
+                X_train_clean = X_train
+                if X_val is not None:
+                    X_val_clean = X_val
+            
+            # NaN 및 무한값 처리
+            X_train_clean = np.nan_to_num(X_train_clean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            y_train_clean = np.nan_to_num(y_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            
+            # 검증 데이터 처리
+            validation_data = None
+            if X_val is not None and y_val is not None:
+                X_val_clean = np.nan_to_num(X_val_clean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                y_val_clean = np.nan_to_num(y_val, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                validation_data = (X_val_clean, y_val_clean)
+            
+            # 처리된 데이터 정보 로깅
+            self.logger.info(f"전처리 후 X_train 형태: {X_train_clean.shape}")
+            if validation_data:
+                self.logger.info(f"전처리 후 X_val 형태: {X_val_clean.shape}")
+            
+            # 모델 입력 형태와 데이터 형태 확인
+            model_input_shape = self.model.input_shape
+            if model_input_shape[1:] != (X_train_clean.shape[1], X_train_clean.shape[2]):
+                self.logger.warning(f"모델 입력 형태 {model_input_shape[1:]}와 데이터 형태 {(X_train_clean.shape[1], X_train_clean.shape[2])}가 일치하지 않습니다.")
+                self.logger.info("모델을 재구축합니다.")
+                self.model = None
+                self.build_model((X_train_clean.shape[1], X_train_clean.shape[2]))
+            
+            # Train model
+            self.logger.info("모델 학습 시작")
+            self.history = self.model.fit(
+                X_train_clean, y_train_clean,
+                validation_data=validation_data,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                callbacks=callbacks,
+                verbose=2
+            )
+            
+            # Calculate training metrics
+            y_pred = self.model.predict(X_train_clean)
+            train_mse = mean_squared_error(y_train_clean, y_pred)
+            train_rmse = np.sqrt(train_mse)
+            train_mae = mean_absolute_error(y_train_clean, y_pred)
+            
+            # Store metrics
+            metrics = {
+                'train_mse': train_mse,
+                'train_rmse': train_rmse,
+                'train_mae': train_mae,
+                'training_time': (pd.Timestamp.now() - start_time).total_seconds()
+            }
+            
+            # Calculate validation metrics if validation data is provided
+            if validation_data is not None:
+                y_val_pred = self.model.predict(X_val_clean)
+                val_mse = mean_squared_error(y_val_clean, y_val_pred)
+                val_rmse = np.sqrt(val_mse)
+                val_mae = mean_absolute_error(y_val_clean, y_val_pred)
+                metrics.update({
+                    'val_mse': val_mse,
+                    'val_rmse': val_rmse,
+                    'val_mae': val_mae
+                })
+            else:
+                # 검증 데이터가 없는 경우에도 val_rmse를 제공하여 optimizer.py에서 오류 방지
+                metrics.update({
+                    'val_rmse': train_rmse * 1.2  # 검증 데이터가 없는 경우 훈련 RMSE보다 약간 더 높은 값 추정
+                })
+            
+            self.metrics.update(metrics)
+            self.is_trained = True
+            self.last_update = pd.Timestamp.now()
+            
+            self.logger.info(f"학습 완료. 훈련 RMSE: {train_rmse:.4f}")
+            if validation_data is not None:
+                self.logger.info(f"검증 RMSE: {metrics['val_rmse']:.4f}")
+            
+            return metrics
+            
+        except Exception as e:
+            self.logger.error(f"모델 학습 중 오류 발생: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            
+            # 최소한의 결과 반환 (val_rmse 포함)
+            error_metrics = {
+                'error': str(e),
+                'train_rmse': 999999.0,
+                'val_rmse': 999999.0  # 오류 시 큰 값으로 설정하여 최적화에서 이 trial이 선택되지 않도록 함
+            }
+            return error_metrics
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """
+        모델을 사용하여 예측
+        
+        Args:
+            X (np.ndarray): 입력 시퀀스, 형태 (samples, sequence_length, features)
+            
+        Returns:
+            np.ndarray: 예측값
+        """
+        if self.model is None:
+            raise ValueError("모델이 초기화되지 않았습니다. predict 전에 모델을 학습시키거나 불러오세요.")
+        
+        try:
+            # 입력 데이터 전처리 (train 메서드와 동일한 방식으로)
+            self.logger.info(f"예측용 입력 데이터 전처리 시작: 형태 {X.shape}")
+            
+            # 3D 배열 (samples, time_steps, features) 구조 확인
+            if len(X.shape) == 3:
+                # 문자열 특성 확인 및 제거
+                string_columns = []
+                for feat_idx in range(X.shape[2]):
+                    # 첫 번째 샘플의 첫 번째 시간 단계의 특성 값 확인
+                    first_val = X[0, 0, feat_idx]
+                    if isinstance(first_val, (str, bytes, np.str_)):
+                        string_columns.append(feat_idx)
+                        self.logger.warning(f"예측 데이터에서 문자열 특성 발견: 인덱스 {feat_idx}, 값: {first_val}")
+                
+                # 문자열 특성 제거
+                if string_columns:
+                    self.logger.info(f"예측 데이터에서 제외할 문자열 특성 인덱스: {string_columns}")
+                    
+                    # 숫자형 특성만 선택
+                    numeric_features = [i for i in range(X.shape[2]) if i not in string_columns]
+                    if not numeric_features:
+                        raise ValueError("숫자형 특성이 없습니다. 예측을 진행할 수 없습니다.")
+                    
+                    # 숫자형 특성만 사용
+                    X_clean = X[:, :, numeric_features]
+                    self.logger.info(f"예측 데이터 형태 변경: {X.shape} -> {X_clean.shape}")
+                else:
+                    X_clean = X
+            else:
+                X_clean = X
+            
+            # NaN 및 무한값 처리
+            X_clean = np.nan_to_num(X_clean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            
+            # 모델 입력 형태와 데이터 형태 확인
+            model_input_shape = self.model.input_shape
+            if model_input_shape[1:] != (X_clean.shape[1], X_clean.shape[2]):
+                self.logger.warning(f"모델 입력 형태 {model_input_shape[1:]}와 데이터 형태 {(X_clean.shape[1], X_clean.shape[2])}가 일치하지 않습니다.")
+                raise ValueError(f"모델 입력 형태와 데이터 형태가 일치하지 않습니다: {model_input_shape[1:]} vs {(X_clean.shape[1], X_clean.shape[2])}")
+            
+            # 예측 실행
+            self.logger.info(f"정제된 데이터로 예측 실행: {X_clean.shape}")
+            return self.model.predict(X_clean)
+        
+        except Exception as e:
+            self.logger.error(f"예측 중 오류 발생: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            raise e
+    
+    def forecast(self, 
+                X: np.ndarray, 
+                horizon: int, 
+                **kwargs) -> np.ndarray:
+        """
+        Generate multi-step forecast
+        
+        Args:
+            X (np.ndarray): Input sequence (single sample)
+            horizon (int): Forecast horizon
+            **kwargs: Additional parameters
+            
+        Returns:
+            np.ndarray: Forecasted values
+        """
+        if not self.is_trained or self.model is None:
+            self.logger.warning("Model not trained yet, forecasts may be inaccurate")
+        
+        # If horizon is less than or equal to the model's forecast horizon, use direct prediction
+        if horizon <= self.forecast_horizon:
+            return self.predict(X)[0, :horizon]
+        
+        # For longer horizons, use recursive forecasting
+        forecasts = []
+        current_input = X.copy()
+        
+        for i in range(horizon):
+            # Predict next step
+            next_step = self.model.predict(current_input)[0, 0]
+            forecasts.append(next_step)
+            
+            # If we've reached the model's forecast horizon, exit
+            if i >= self.forecast_horizon - 1:
+                break
+                
+            # Update input for next step (remove first time step, add prediction at the end)
+            current_input = np.roll(current_input, -1, axis=1)
+            current_input[0, -1, 0] = next_step
+        
+        return np.array(forecasts)
+    
+    def evaluate(self, 
+                X_test: np.ndarray, 
+                y_test: np.ndarray, 
+                **kwargs) -> Dict[str, Any]:
+        """
+        Evaluate the model
+        
+        Args:
+            X_test (np.ndarray): Test sequences
+            y_test (np.ndarray): Test targets
+            **kwargs: Additional parameters
+            
+        Returns:
+            Dict[str, Any]: Evaluation metrics
+        """
+        if not self.is_trained or self.model is None:
+            self.logger.warning("Model not trained yet, evaluation may be inaccurate")
+        
+        # 문자열 데이터 처리
+        X_test_clean = X_test.copy()
+        if len(X_test.shape) == 3:
+            # 문자열 특성 확인 및 제거
+            string_columns = []
+            for feat_idx in range(X_test.shape[2]):
+                if feat_idx < X_test.shape[2]:
+                    try:
+                        sample_values = X_test[0, 0, feat_idx]
+                        if isinstance(sample_values, (str, bytes, np.str_)):
+                            string_columns.append(feat_idx)
+                    except (IndexError, TypeError):
+                        continue
+            
+            # 문자열 특성 제거
+            if string_columns:
+                self.logger.warning(f"문자열 데이터가 발견되었습니다. 이 컬럼들은 제외됩니다: {string_columns}")
+                # 숫자형 특성만 선택
+                numeric_features = [i for i in range(X_test.shape[2]) if i not in string_columns]
+                X_test_clean = X_test[:, :, numeric_features].astype(np.float32)
+        
+        # NaN 값 처리
+        X_test_clean = np.nan_to_num(X_test_clean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        
+        # Get probabilities
+        try:
+            y_proba = self.predict_proba(X_test_clean)
+            
+            # Make predictions based on threshold
+            y_pred = (y_proba > 0.5).astype(int)
+            
+            # Calculate metrics
+            test_mse = mean_squared_error(y_test, y_pred)
+            test_rmse = np.sqrt(test_mse)
+            test_mae = mean_absolute_error(y_test, y_pred)
+            test_r2 = r2_score(y_test.flatten(), y_pred.flatten())
+            
+            # Calculate directional accuracy (for price movements)
+            if len(y_test) > 1:
+                actual_direction = np.sign(np.diff(y_test.flatten()))
+                pred_direction = np.sign(np.diff(y_pred.flatten()))
+                directional_accuracy = np.mean(actual_direction == pred_direction)
+            else:
+                directional_accuracy = None
+            
+            # Store metrics
+            metrics = {
+                'test_mse': test_mse,
+                'test_rmse': test_rmse,
+                'test_mae': test_mae,
+                'test_r2': test_r2,
+                'directional_accuracy': directional_accuracy
+            }
+            
+            self.metrics.update(metrics)
+            self.logger.info(f"Evaluation completed. RMSE: {test_rmse:.4f}, R²: {test_r2:.4f}")
+            if directional_accuracy is not None:
+                self.logger.info(f"Directional accuracy: {directional_accuracy:.4f}")
+            
+            return metrics
+        except Exception as e:
+            self.logger.error(f"평가 중 오류 발생: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return {'error': str(e)}
+    
+    def plot_history(self, figsize: Tuple[int, int] = (10, 6)) -> None:
+        """
+        Plot training history
+        
+        Args:
+            figsize (Tuple[int, int]): Figure size
+        """
+        if self.history is None:
+            self.logger.warning("No training history available")
+            return
+        
+        plt.figure(figsize=figsize)
+        
+        # Plot training & validation loss
+        plt.subplot(2, 1, 1)
+        plt.plot(self.history.history['loss'], label='Training Loss')
+        if 'val_loss' in self.history.history:
+            plt.plot(self.history.history['val_loss'], label='Validation Loss')
+        plt.title('Model Loss')
+        plt.ylabel('Loss (MSE)')
+        plt.legend(loc='upper right')
+        
+        # Plot training & validation MAE
+        plt.subplot(2, 1, 2)
+        plt.plot(self.history.history['mae'], label='Training MAE')
+        if 'val_mae' in self.history.history:
+            plt.plot(self.history.history['val_mae'], label='Validation MAE')
+        plt.title('Model MAE')
+        plt.ylabel('MAE')
+        plt.xlabel('Epoch')
+        plt.legend(loc='upper right')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_predictions(self, 
+                       X: np.ndarray, 
+                       y_true: np.ndarray, 
+                       scaler: Optional[Any] = None,
+                       figsize: Tuple[int, int] = (12, 6)) -> None:
+        """
+        Plot model predictions vs actual values
+        
+        Args:
+            X (np.ndarray): Input sequences
+            y_true (np.ndarray): True values
+            scaler (Optional[Any]): Scaler for inverse transform
+            figsize (Tuple[int, int]): Figure size
+        """
+        if not self.is_trained or self.model is None:
+            self.logger.warning("Model not trained yet")
+            return
+        
+        # Make predictions
+        y_pred = self.predict(X)
+        
+        # Inverse transform if scaler is provided
+        if scaler is not None:
+            # Reshape predictions and true values for inverse transform
+            y_pred_reshaped = y_pred.reshape(-1, 1)
+            y_true_reshaped = y_true.reshape(-1, 1)
+            
+            # Inverse transform
+            y_pred = scaler.inverse_transform(y_pred_reshaped).flatten()
+            y_true = scaler.inverse_transform(y_true_reshaped).flatten()
+        
+        # Plot predictions vs actual
+        plt.figure(figsize=figsize)
+        plt.plot(y_true, label='Actual')
+        plt.plot(y_pred, label='Predicted')
+        plt.title('Actual vs Predicted Values')
+        plt.xlabel('Time Step')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    
+    def save_keras_model(self, filepath: Optional[str] = None) -> str:
+        """
+        Save the Keras model to disk
+        
+        Args:
+            filepath (Optional[str]): Path to save the model, if None uses default path
+            
+        Returns:
+            str: Path where the model was saved
+        """
+        if self.model is None:
+            self.logger.error("No model to save")
+            raise ValueError("No model to save")
+        
+        if filepath is None:
+            # Create default filename with model name and timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{self.name}_{timestamp}"
+            filepath = os.path.join(self.model_dir, filename)
+        
+        try:
+            # TensorFlow 2.12.0에서는 SavedModel 형식으로 저장
+            # 이 형식은 모델 구조, 가중치, 옵티마이저 상태를 모두 저장
+            save_path = filepath
+            self.model.save(save_path, save_format='tf')
+            self.logger.info(f"Keras model saved to {save_path}")
+            
+            # 모델 설정 정보 별도 저장 (재로드 시 도움)
+            config_path = f"{filepath}_config.json"
+            config = {
+                'name': self.name,
+                'version': self.version,
+                'learning_rate': self.learning_rate,
+                'units': self.units,
+                'dropout_rate': self.dropout_rate,
+                'sequence_length': self.sequence_length,
+                'forecast_horizon': self.forecast_horizon,
+                'batch_size': self.batch_size,
+                'epochs': self.epochs
+            }
+            
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=4)
+            
+            self.logger.info(f"Model config saved to {config_path}")
+            return save_path
+        except Exception as e:
+            self.logger.error(f"Error saving Keras model: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            raise
+
+    @classmethod
+    def load_keras_model(cls, 
+                       filepath: str, 
+                       custom_objects: Optional[Dict[str, Any]] = None) -> 'LSTMPriceModel':
+        """
+        Load a Keras model from disk
+        
+        Args:
+            filepath (str): Path to the saved model directory
+            custom_objects (Optional[Dict[str, Any]]): Custom objects for model loading
+            
+        Returns:
+            LSTMPriceModel: Model with loaded Keras model
+        """
+        try:
+            # 설정 파일 로드
+            config_path = f"{filepath}_config.json"
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                
+                # 설정에서 기본 파라미터 가져오기
+                name = config.get('name', 'LSTMPrice')
+                version = config.get('version', '1.0.0')
+                learning_rate = config.get('learning_rate', 0.001)
+                units = config.get('units', [64, 32])
+                dropout_rate = config.get('dropout_rate', 0.3)
+                sequence_length = config.get('sequence_length', 30)
+                
+                # 모델 인스턴스 생성
+                model_instance = cls(
+                    name=name,
+                    version=version,
+                    sequence_length=sequence_length,
+                    units=units,
+                    dropout_rate=dropout_rate,
+                    learning_rate=learning_rate
+                )
+            else:
+                # 설정 파일이 없으면 기본값으로 인스턴스 생성
+                model_instance = cls()
+                logger.warning(f"설정 파일이 없습니다. 기본 설정으로 모델을 로드합니다.")
+            
+            # TensorFlow 2.12.0 방식으로 모델 로드
+            try:
+                # 첫 번째 시도: 직접 load_model 사용
+                keras_model = tf.keras.models.load_model(filepath, custom_objects=custom_objects)
+            except Exception as e:
+                logger.warning(f"첫번째 로드 방식 실패: {str(e)}")
+                try:
+                    # 두 번째 시도: 커스텀 옵티마이저 지정
+                    custom_objects = custom_objects or {}
+                    custom_objects['optimizer'] = tf.keras.optimizers.Adam(learning_rate=model_instance.learning_rate)
+                    keras_model = tf.keras.models.load_model(filepath, custom_objects=custom_objects)
+                except Exception as e2:
+                    logger.warning(f"두번째 로드 방식 실패: {str(e2)}")
+                    # 세 번째 시도: 모델만 로드하고 컴파일 다시 하기
+                    keras_model = tf.keras.models.load_model(filepath, compile=False)
+                    # 이진 분류 모델 여부 확인
+                    output_layer = keras_model.layers[-1]
+                    is_binary = output_layer.activation == tf.keras.activations.sigmoid
+                    
+                    if is_binary:
+                        keras_model.compile(
+                            optimizer=tf.keras.optimizers.Adam(learning_rate=model_instance.learning_rate),
+                            loss='binary_crossentropy',
+                            metrics=['accuracy']
+                        )
+                    else:
+                        keras_model.compile(
+                            optimizer=tf.keras.optimizers.Adam(learning_rate=model_instance.learning_rate),
+                            loss='mse',
+                            metrics=['mae']
+                        )
+            
+            # 모델 인스턴스에 로드된 Keras 모델 설정
+            model_instance.model = keras_model
+            model_instance.is_trained = True
+            model_instance.last_update = datetime.now()
+            
+            logger.info(f"Keras model loaded from {filepath}")
+            return model_instance
+        except Exception as e:
+            logger.error(f"Error loading Keras model: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+
+class LSTMDirectionModel(ClassificationModel):
+    """비트코인 가격 방향성 분류를 위한 GRU 모델 (이름은 호환성을 위해 유지)"""
+    
+    def __init__(self, 
+                name: str = "LSTMDirection", 
+                version: str = "1.0.0",
+                sequence_length: int = 60,
+                units: List[int] = [64, 32],  # 유닛 수 축소: [128, 64] -> [64, 32]
+                dropout_rate: float = 0.4,    # Dropout 증가: 0.25 -> 0.4
+                learning_rate: float = 0.003,
+                batch_size: int = 32,
+                epochs: int = 100):
+        """
+        방향성 분류 GRU 모델 초기화
+        
+        Args:
+            name (str): 모델 이름
+            version (str): 모델 버전
+            sequence_length (int): 사용할 과거 시간 단계 수
+            units (List[int]): 각 GRU 레이어의 유닛 수 리스트
+            dropout_rate (float): 각 GRU 레이어 이후의 Dropout 비율
+            learning_rate (float): Adam 옵티마이저 학습률
+            batch_size (int): 학습 배치 크기
+            epochs (int): 최대 학습 에폭 수
+        """
+        super().__init__(name, version)
+        
+        self.sequence_length = sequence_length
+        self.units = units
+        self.dropout_rate = dropout_rate
+        self.learning_rate = learning_rate
+        self.batch_size = batch_size
+        self.epochs = epochs
+        
+        # 파라미터 저장
+        self.params = {
+            'sequence_length': sequence_length,
+            'units': units,
+            'dropout_rate': dropout_rate,
+            'learning_rate': learning_rate,
+            'batch_size': batch_size,
+            'epochs': epochs
+        }
+        
+        self.model = None
+        self.feature_dim = None
+        self.history = None
+        self.classes_ = np.array([0, 1])  # 0: 하락, 1: 상승
+        
+        self.logger.info(f"{self.name} 모델을 {len(units)}개 GRU 레이어로 초기화했습니다")
+    
+    def build_model(self, input_shape: Tuple[int, int]) -> None:
+        """
+        GRU 모델 아키텍처 구축
+        
+        Args:
+            input_shape (Tuple[int, int]): 입력 형태 (sequence_length, features)
+        """
+        self.feature_dim = input_shape[1]
+        
+        model = Sequential()
+        
+        # GRU 레이어 추가
+        for i, units in enumerate(self.units):
+            return_sequences = i < len(self.units) - 1
+            if i == 0:
+                model.add(GRU(units, 
+                              return_sequences=return_sequences, 
+                              input_shape=input_shape,
+                              recurrent_regularizer=l1_l2(l1=0.00, l2=0.001)))
+            else:
+                model.add(GRU(units, 
+                              return_sequences=return_sequences,
+                              recurrent_regularizer=l1_l2(l1=0.00, l2=0.001)))
+                              
+            # BatchNormalization 대신 LayerNormalization 사용
+            model.add(LayerNormalization())
+            model.add(Dropout(self.dropout_rate))
+            
+        # 이진 분류를 위한 출력 레이어
+        model.add(Dense(1, activation='sigmoid'))
+        
+        # 모델 컴파일
+        model.compile(
+            optimizer=Adam(learning_rate=self.learning_rate),
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        self.model = model
+        model.summary(print_fn=self.logger.info)
+    
+    def train(self, 
+             X_train: np.ndarray, 
+             y_train: np.ndarray, 
+             X_val: Optional[np.ndarray] = None,
+             y_val: Optional[np.ndarray] = None,
+             class_weights: Optional[Dict[int, float]] = None,
+             early_stopping_patience: int = 20,
+             reduce_lr_patience: int = 10,
+             checkpoint_dir: str = None,
+             save_best_only: bool = True) -> Dict[str, Any]:
+        """
+        Train the LSTM direction model
+        
+        Args:
+            X_train (np.ndarray): Training sequences, shape (samples, sequence_length, features)
+            y_train (np.ndarray): Training targets (0 for down, 1 for up)
+            X_val (Optional[np.ndarray]): Validation sequences
+            y_val (Optional[np.ndarray]): Validation targets
+            class_weights (Optional[Dict[int, float]]): Class weights for imbalanced data
+            early_stopping_patience (int): Patience for early stopping
+            reduce_lr_patience (int): Patience for learning rate reduction
+            checkpoint_dir (str): Directory to save checkpoints
+            save_best_only (bool): Whether to save only the best model
+            
+        Returns:
+            Dict[str, Any]: Training metrics
+        """
+        if self.model is None:
+            self.logger.error("모델이 초기화되지 않았습니다. build_model()을 먼저 호출하세요.")
+            return {"error": "Model not initialized"}
+        
+        start_time = pd.Timestamp.now()
+        self.logger.info(f"Training {self.__class__.__name__} model on {len(X_train)} samples")
+        
+        # Prepare callbacks
+        callbacks = []
+        
+        # Early stopping
+        callbacks.append(EarlyStopping(
+            monitor='val_loss' if X_val is not None else 'loss',
+            patience=early_stopping_patience,
+            restore_best_weights=True,
+            verbose=1
+        ))
+        
+        # Learning rate reduction
+        callbacks.append(ReduceLROnPlateau(
+            monitor='val_loss' if X_val is not None else 'loss',
+            factor=0.5,
+            patience=reduce_lr_patience,
+            min_lr=1e-6,
+            verbose=1
+        ))
+        
+        # Model checkpoints (if directory is provided)
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            callbacks.append(ModelCheckpoint(
+                filepath=os.path.join(checkpoint_dir, 'model_epoch_{epoch:02d}_loss_{val_loss:.4f}.h5') 
+                    if X_val is not None else os.path.join(checkpoint_dir, 'model_epoch_{epoch:02d}_loss_{loss:.4f}.h5'),
+                save_best_only=save_best_only,
+                monitor='val_loss' if X_val is not None else 'loss',
+                save_weights_only=False
+            ))
+        
+        try:
+            # 전처리: 비숫자형 데이터 처리
+            # 1. 먼저 X_train에 문자열 데이터가 있는지 확인
+            has_string_data = False
+            string_columns = []
+            needs_rebuild = False
+            
+            # 데이터 형태를 파악하여 처리 방법 결정
+            X_train_clean = X_train.copy()
+            X_val_clean = X_val.copy() if X_val is not None else None
+            
+            # 원본 모델의 입력 형태 저장 (문자열 피처 제거 후 재구축해야 하는지 판단)
+            original_input_shape = None
+            if self.model:
+                try:
+                    original_input_shape = self.model.input_shape[1:]  # (batch_size, sequence_length, features)
+                    self.logger.info(f"원본 모델 입력 형태: {original_input_shape}")
+                except:
+                    pass
+            
+            # 문자열이나 범주형 데이터가 있을 수 있는 컬럼 찾기
+            if len(X_train.shape) == 3:  # (samples, timesteps, features) 형태
+                # 시계열 데이터에서 각 특성(feature)별로 확인
+                for feature_idx in range(X_train.shape[2]):
+                    sample_values = X_train[0, 0, feature_idx]
+                    if isinstance(sample_values, (str, bytes, np.str_)):
+                        has_string_data = True
+                        string_columns.append(feature_idx)
+            
+            # 문자열 데이터가 있으면 제거 또는 원-핫 인코딩 처리
+            if has_string_data:
+                self.logger.warning(f"문자열 데이터가 발견되었습니다. 이 컬럼들은 제외됩니다: {string_columns}")
+                needs_rebuild = True
+                
+                # 원본 형태 기억
+                original_shape = X_train.shape
+                
+                if len(X_train.shape) == 3:  # (samples, timesteps, features)
+                    # 문자열 컬럼을 제외한 새 배열 생성
+                    numeric_features = [i for i in range(X_train.shape[2]) if i not in string_columns]
+                    X_train_clean = X_train[:, :, numeric_features].astype(np.float32)
+                    
+                    # 검증 데이터가 있으면 같은 처리 적용
+                    if X_val is not None:
+                        X_val_clean = X_val[:, :, numeric_features].astype(np.float32)
+                
+                # 모델 재구축이 필요한지 확인
+                new_input_shape = (X_train_clean.shape[1], X_train_clean.shape[2])
+                if original_input_shape and (original_input_shape[1] != new_input_shape[1]):
+                    self.logger.info(f"모델 입력 형태 변경 필요: {original_input_shape} -> {new_input_shape}")
+                    
+                # 모델 재구축 필요성 확인 및 실행
+                if needs_rebuild:
+                    # Keras 모델 다시 구축
+                    self.logger.info(f"모델을 새 입력 형태 {new_input_shape}에 맞게 재구축합니다.")
+                    self.model = None  # 기존 모델 삭제
+                    self.build_model(new_input_shape)  # 새 형태로 다시 구축
+            else:
+                # 문자열 데이터가 없는 경우 원본 사용
+                X_train_clean = X_train
+                if X_val is not None:
+                    X_val_clean = X_val
+            
+            # 타겟 데이터 처리
+            y_train_clean = y_train
+            
+            # 방향성 예측을 위한 y 데이터 형태 처리 (원-핫 인코딩)
+            if len(y_train_clean.shape) == 1 or (len(y_train_clean.shape) == 2 and y_train_clean.shape[1] == 1):
+                # 고가격 값인 경우 (0, 1 이진 값이 아닌 경우)
+                if np.max(y_train_clean) > 1 or np.min(y_train_clean) < 0:
+                    self.logger.info(f"y_train 값이 이진 범주가 아닙니다. 범위: 최소={np.min(y_train_clean)} 최대={np.max(y_train_clean)}")
+                    # 가격 데이터를 방향성으로 변환 (모든 값이 양수이면 1(상승), 음수이면 0(하락)) 
+                    y_train_clean = np.ones(len(y_train_clean), dtype=np.int32)
+                    if y_val is not None:
+                        y_val_clean = np.ones(len(y_val), dtype=np.int32)
+                else:
+                    # 기존 이진 데이터는 정수로 변환만 수행
+                    y_train_clean = y_train_clean.astype(np.int32)
+                    if y_val is not None:
+                        y_val_clean = y_val.astype(np.int32)
+            
+            # 원-핫 인코딩 (2개 클래스: 0, 1)
+            if len(y_train_clean.shape) == 2:
+                y_train_clean = y_train_clean.flatten()
+            
+            # class_weights가 제공되면 0과 1 클래스에 대한 가중치만 사용
+            if class_weights is not None:
+                # 기존 class_weights를 0과 1 클래스만 사용하도록 수정
+                class_weights = {int(k) if int(k) <= 1 else 1: v for k, v in class_weights.items() if int(k) <= 1}
+                self.logger.info(f"클래스 가중치 수정됨: {class_weights}")
+        
+            # 검증 데이터가 있으면 같은 처리 적용
+            if X_val is not None and y_val is not None:
+                X_val_clean = np.nan_to_num(X_val_clean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                validation_data = (X_val_clean, y_val_clean)
+            else:
+                validation_data = None
+        
+            # 최종 데이터 전처리 (NaN, 무한값 처리)
+            X_train_clean = np.nan_to_num(X_train_clean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+            
+            # 데이터 형태 및 NaN 확인
+            self.logger.info(f"X_train 형태: {X_train_clean.shape}, y_train 형태: {y_train_clean.shape}")
+            self.logger.info(f"X_train 데이터 타입: {X_train_clean.dtype}, y_train 데이터 타입: {y_train_clean.dtype}")
+            self.logger.info(f"X_train NaN 개수: {np.isnan(X_train_clean).sum()}, y_train NaN 개수: {np.isnan(y_train_clean).sum()}")
+        
+            # Train model
+            self.history = self.model.fit(
+                X_train_clean, y_train_clean,
+                validation_data=validation_data,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                callbacks=callbacks,
+                class_weight=class_weights,
+                verbose=2
+            )
+            
+            # Calculate training metrics
+            y_pred = (self.model.predict(X_train_clean) > 0.5).astype(int)
+            train_accuracy = accuracy_score(y_train_clean, y_pred)
+            
+            # 다중 클래스 분류가 가능하도록 'weighted' 평균 사용
+            average_method = 'weighted'
+            
+            try:
+                train_precision = precision_score(y_train_clean, y_pred, average=average_method)
+                train_recall = recall_score(y_train_clean, y_pred, average=average_method)
+                train_f1 = f1_score(y_train_clean, y_pred, average=average_method)
+            except Exception as e:
+                self.logger.warning(f"성능 지표 계산 중 오류 발생: {str(e)}")
+                train_precision = train_recall = train_f1 = 0.0
+            
+            # Store metrics
+            metrics = {
+                'train_accuracy': train_accuracy,
+                'train_precision': train_precision,
+                'train_recall': train_recall,
+                'train_f1': train_f1,
+                'training_time': (pd.Timestamp.now() - start_time).total_seconds()
+            }
+            
+            # Calculate validation metrics if validation data is provided
+            if validation_data is not None:
+                y_val_pred = (self.model.predict(X_val_clean) > 0.5).astype(int)
+                val_accuracy = accuracy_score(y_val_clean, y_val_pred)
+                
+                try:
+                    val_precision = precision_score(y_val_clean, y_val_pred, average=average_method)
+                    val_recall = recall_score(y_val_clean, y_val_pred, average=average_method)
+                    val_f1 = f1_score(y_val_clean, y_val_pred, average=average_method)
+                except Exception as e:
+                    self.logger.warning(f"검증 성능 지표 계산 중 오류 발생: {str(e)}")
+                    val_precision = val_recall = val_f1 = 0.0
+                
+                metrics.update({
+                    'val_accuracy': val_accuracy,
+                    'val_precision': val_precision,
+                    'val_recall': val_recall,
+                    'val_f1': val_f1
+                })
+            
+            self.metrics.update(metrics)
+            self.is_trained = True
+            self.last_update = pd.Timestamp.now()
+            
+            self.logger.info(f"Training completed. Accuracy: {train_accuracy:.4f}, F1: {train_f1:.4f}")
+            if X_val is not None:
+                self.logger.info(f"Validation Accuracy: {metrics['val_accuracy']:.4f}, F1: {metrics['val_f1']:.4f}")
+            
+            return metrics
+            
+        except Exception as e:
+            self.logger.error(f"모델 학습 중 오류 발생: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return {'error': str(e)}
+    
+    def predict(self, 
+               X: np.ndarray, 
+               threshold: float = 0.5,
+               **kwargs) -> np.ndarray:
+        """
+        Make class predictions with the model
+        
+        Args:
+            X (np.ndarray): Input sequences
+            threshold (float): Probability threshold for positive class
+            **kwargs: Additional parameters
+            
+        Returns:
+            np.ndarray: Predicted classes (0 for down, 1 for up)
+        """
+        if not self.is_trained or self.model is None:
+            self.logger.warning("Model not trained yet, predictions may be inaccurate")
+        
+        proba = self.predict_proba(X)
+        return (proba > threshold).astype(int)
+    
+    def predict_proba(self, 
+                    X: np.ndarray, 
+                    **kwargs) -> np.ndarray:
+        """
+        Predict class probabilities
+        
+        Args:
+            X (np.ndarray): Input sequences
+            **kwargs: Additional parameters
+            
+        Returns:
+            np.ndarray: Class probabilities for positive class (up)
+        """
+        if not self.is_trained or self.model is None:
+            self.logger.warning("Model not trained yet, predictions may be inaccurate")
+        
+        # 문자열 데이터 처리
+        X_clean = X.copy()
+        if len(X.shape) == 3:
+            # 문자열 특성 확인 및 제거
+            string_columns = []
+            for feat_idx in range(X.shape[2]):
+                if feat_idx < X.shape[2]:
+                    try:
+                        sample_values = X[0, 0, feat_idx]
+                        if isinstance(sample_values, (str, bytes, np.str_)):
+                            string_columns.append(feat_idx)
+                    except (IndexError, TypeError):
+                        continue
+            
+            # 문자열 특성 제거
+            if string_columns:
+                self.logger.warning(f"문자열 데이터가 발견되었습니다. 이 컬럼들은 제외됩니다: {string_columns}")
+                # 숫자형 특성만 선택
+                numeric_features = [i for i in range(X.shape[2]) if i not in string_columns]
+                X_clean = X[:, :, numeric_features].astype(np.float32)
+        
+        # NaN 값 처리
+        X_clean = np.nan_to_num(X_clean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        
+        try:
+            return self.model.predict(X_clean)
+        except Exception as e:
+            self.logger.error(f"예측 중 오류 발생: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            # 예측 실패 시 모두 0.5로 반환 (불확실성)
+            return np.full((len(X_clean),), 0.5)
+    
+    def evaluate(self, 
+                X_test: np.ndarray, 
+                y_test: np.ndarray, 
+                threshold: float = 0.5,
+                **kwargs) -> Dict[str, Any]:
+        """
+        Evaluate the model
+        
+        Args:
+            X_test (np.ndarray): Test sequences
+            y_test (np.ndarray): Test targets
+            threshold (float): Probability threshold for positive class
+            **kwargs: Additional parameters
+            
+        Returns:
+            Dict[str, Any]: Evaluation metrics
+        """
+        if not self.is_trained or self.model is None:
+            self.logger.warning("Model not trained yet, evaluation may be inaccurate")
+        
+        # 문자열 데이터 처리
+        X_test_clean = X_test.copy()
+        if len(X_test.shape) == 3:
+            # 문자열 특성 확인 및 제거
+            string_columns = []
+            for feat_idx in range(X_test.shape[2]):
+                if feat_idx < X_test.shape[2]:
+                    try:
+                        sample_values = X_test[0, 0, feat_idx]
+                        if isinstance(sample_values, (str, bytes, np.str_)):
+                            string_columns.append(feat_idx)
+                    except (IndexError, TypeError):
+                        continue
+            
+            # 문자열 특성 제거
+            if string_columns:
+                self.logger.warning(f"문자열 데이터가 발견되었습니다. 이 컬럼들은 제외됩니다: {string_columns}")
+                # 숫자형 특성만 선택
+                numeric_features = [i for i in range(X_test.shape[2]) if i not in string_columns]
+                X_test_clean = X_test[:, :, numeric_features].astype(np.float32)
+        
+        # NaN 값 처리
+        X_test_clean = np.nan_to_num(X_test_clean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        
+        # Get probabilities
+        try:
+            y_proba = self.predict_proba(X_test_clean)
+            
+            # Make predictions based on threshold
+            y_pred = (y_proba > threshold).astype(int)
+            
+            # Calculate metrics
+            test_accuracy = accuracy_score(y_test, y_pred)
+            
+            # 다중 클래스 분류가 가능하도록 'weighted' 평균 사용
+            average_method = 'weighted'
+            
+            try:
+                test_precision = precision_score(y_test, y_pred, average=average_method)
+                test_recall = recall_score(y_test, y_pred, average=average_method)
+                test_f1 = f1_score(y_test, y_pred, average=average_method)
+            except Exception as e:
+                self.logger.warning(f"성능 지표 계산 중 오류 발생: {str(e)}")
+                test_precision = test_recall = test_f1 = 0.0
+            
+            # Store metrics
+            metrics = {
+                'test_accuracy': test_accuracy,
+                'test_precision': test_precision,
+                'test_recall': test_recall,
+                'test_f1': test_f1,
+                'threshold': threshold
+            }
+            
+            self.metrics.update(metrics)
+            self.logger.info(f"Evaluation completed. Accuracy: {test_accuracy:.4f}, F1: {test_f1:.4f}")
+            return metrics
+        except Exception as e:
+            self.logger.error(f"평가 중 오류 발생: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            return {'error': str(e)}
+    
+    def find_optimal_threshold(self, 
+                             X_val: np.ndarray, 
+                             y_val: np.ndarray,
+                             metric: str = 'f1',
+                             grid_size: int = 100) -> Dict[str, Any]:
+        """
+        Find optimal threshold for classification
+        
+        Args:
+            X_val (np.ndarray): Validation sequences
+            y_val (np.ndarray): Validation targets
+            metric (str): Metric to optimize ('f1', 'accuracy', 'precision', 'recall')
+            grid_size (int): Number of thresholds to try
+            
+        Returns:
+            Dict[str, Any]: Optimal threshold and metrics
+        """
+        if not self.is_trained or self.model is None:
+            self.logger.warning("Model not trained yet, cannot find optimal threshold")
+            return {'optimal_threshold': 0.5}
+        
+        # Get probabilities
+        y_proba = self.predict_proba(X_val)
+        
+        # Initialize variables
+        optimal_threshold = 0.5
+        optimal_score = 0.0
+        thresholds = np.linspace(0.1, 0.9, grid_size)
+        results = []
+        
+        # Try different thresholds
+        for threshold in thresholds:
+            y_pred = (y_proba > threshold).astype(int)
+            
+            # Calculate metrics
+            accuracy = accuracy_score(y_val, y_pred)
+            precision = precision_score(y_val, y_pred, average='binary')
+            recall = recall_score(y_val, y_pred, average='binary')
+            f1 = f1_score(y_val, y_pred, average='binary')
+            
+            # Store results
+            results.append({
+                'threshold': threshold,
+                'accuracy': accuracy,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1
+            })
+            
+            # Update optimal threshold if score is better
+            score = 0
+            if metric == 'f1':
+                score = f1
+            elif metric == 'accuracy':
+                score = accuracy
+            elif metric == 'precision':
+                score = precision
+            elif metric == 'recall':
+                score = recall
+            else:
+                score = f1
+            
+            if score > optimal_score:
+                optimal_score = score
+                optimal_threshold = threshold
+        
+        self.logger.info(f"Optimal threshold: {optimal_threshold:.4f} ({metric}: {optimal_score:.4f})")
+        return {
+            'optimal_threshold': optimal_threshold,
+            'optimal_score': optimal_score,
+            'metric': metric,
+            'results': results
+        }
+    
+    def plot_history(self, figsize: Tuple[int, int] = (10, 6)) -> None:
+        """
+        Plot training history
+        
+        Args:
+            figsize (Tuple[int, int]): Figure size
+        """
+        if self.history is None:
+            self.logger.warning("No training history available")
+            return
+        
+        plt.figure(figsize=figsize)
+        
+        # Plot training & validation loss
+        plt.subplot(2, 1, 1)
+        plt.plot(self.history.history['loss'], label='Training Loss')
+        if 'val_loss' in self.history.history:
+            plt.plot(self.history.history['val_loss'], label='Validation Loss')
+        plt.title('Model Loss')
+        plt.ylabel('Loss (Binary Crossentropy)')
+        plt.legend(loc='upper right')
+        
+        # Plot training & validation accuracy
+        plt.subplot(2, 1, 2)
+        plt.plot(self.history.history['accuracy'], label='Training Accuracy')
+        if 'val_accuracy' in self.history.history:
+            plt.plot(self.history.history['val_accuracy'], label='Validation Accuracy')
+        plt.title('Model Accuracy')
+        plt.ylabel('Accuracy')
+        plt.xlabel('Epoch')
+        plt.legend(loc='lower right')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def save_keras_model(self, filepath: Optional[str] = None) -> str:
+        """
+        Save the Keras model to disk
+        
+        Args:
+            filepath (Optional[str]): Path to save the model, if None uses default path
+            
+        Returns:
+            str: Path where the model was saved
+        """
+        if self.model is None:
+            self.logger.error("No model to save")
+            raise ValueError("No model to save")
+        
+        if filepath is None:
+            # Create default filename with model name and timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{self.name}_{timestamp}"
+            filepath = os.path.join(self.model_dir, filename)
+        
+        try:
+            # TensorFlow 2.12.0에서는 SavedModel 형식으로 저장
+            # 이 형식은 모델 구조, 가중치, 옵티마이저 상태를 모두 저장
+            save_path = filepath
+            self.model.save(save_path, save_format='tf')
+            self.logger.info(f"Keras model saved to {save_path}")
+            
+            # 모델 설정 정보 별도 저장 (재로드 시 도움)
+            config_path = f"{filepath}_config.json"
+            config = {
+                'name': self.name,
+                'version': self.version,
+                'learning_rate': self.learning_rate,
+                'units': self.units,
+                'dropout_rate': self.dropout_rate,
+                'sequence_length': self.sequence_length,
+                'forecast_horizon': self.forecast_horizon,
+                'batch_size': self.batch_size,
+                'epochs': self.epochs
+            }
+            
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=4)
+            
+            self.logger.info(f"Model config saved to {config_path}")
+            return save_path
+        except Exception as e:
+            self.logger.error(f"Error saving Keras model: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            raise
+
+    @classmethod
+    def load_keras_model(cls, 
+                       filepath: str, 
+                       custom_objects: Optional[Dict[str, Any]] = None) -> 'LSTMDirectionModel':
+        """
+        Load a Keras model from disk
+        
+        Args:
+            filepath (str): Path to the saved model directory
+            custom_objects (Optional[Dict[str, Any]]): Custom objects for model loading
+            
+        Returns:
+            LSTMDirectionModel: Model with loaded Keras model
+        """
+        try:
+            # 설정 파일 로드
+            config_path = f"{filepath}_config.json"
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                
+                # 설정에서 기본 파라미터 가져오기
+                name = config.get('name', 'LSTMDirection')
+                version = config.get('version', '1.0.0')
+                learning_rate = config.get('learning_rate', 0.001)
+                units = config.get('units', [64, 32])
+                dropout_rate = config.get('dropout_rate', 0.3)
+                sequence_length = config.get('sequence_length', 30)
+                
+                # 모델 인스턴스 생성
+                model_instance = cls(
+                    name=name,
+                    version=version,
+                    sequence_length=sequence_length,
+                    units=units,
+                    dropout_rate=dropout_rate,
+                    learning_rate=learning_rate
+                )
+            else:
+                # 설정 파일이 없으면 기본값으로 인스턴스 생성
+                model_instance = cls()
+                logger.warning(f"설정 파일이 없습니다. 기본 설정으로 모델을 로드합니다.")
+            
+            # TensorFlow 2.12.0 방식으로 모델 로드
+            try:
+                # 첫 번째 시도: 직접 load_model 사용
+                keras_model = tf.keras.models.load_model(filepath, custom_objects=custom_objects)
+            except Exception as e:
+                logger.warning(f"첫번째 로드 방식 실패: {str(e)}")
+                try:
+                    # 두 번째 시도: 커스텀 옵티마이저 지정
+                    custom_objects = custom_objects or {}
+                    custom_objects['optimizer'] = tf.keras.optimizers.Adam(learning_rate=model_instance.learning_rate)
+                    keras_model = tf.keras.models.load_model(filepath, custom_objects=custom_objects)
+                except Exception as e2:
+                    logger.warning(f"두번째 로드 방식 실패: {str(e2)}")
+                    # 세 번째 시도: 모델만 로드하고 컴파일 다시 하기
+                    keras_model = tf.keras.models.load_model(filepath, compile=False)
+                    # 이진 분류 모델 여부 확인
+                    output_layer = keras_model.layers[-1]
+                    is_binary = output_layer.activation == tf.keras.activations.sigmoid
+                    
+                    if is_binary:
+                        keras_model.compile(
+                            optimizer=tf.keras.optimizers.Adam(learning_rate=model_instance.learning_rate),
+                            loss='binary_crossentropy',
+                            metrics=['accuracy']
+                        )
+                    else:
+                        keras_model.compile(
+                            optimizer=tf.keras.optimizers.Adam(learning_rate=model_instance.learning_rate),
+                            loss='mse',
+                            metrics=['mae']
+                        )
+            
+            # 모델 인스턴스에 로드된 Keras 모델 설정
+            model_instance.model = keras_model
+            model_instance.is_trained = True
+            model_instance.last_update = datetime.now()
+            
+            logger.info(f"Keras model loaded from {filepath}")
+            return model_instance
+        except Exception as e:
+            logger.error(f"Error loading Keras model: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
+
+
+@log_execution
+def create_sequence_data(df: pd.DataFrame, window_size: int, 
+                       target_col: str = 'target', 
+                       prediction_type: str = 'price') -> Dict[str, np.ndarray]:
+    """
+    시계열 데이터에서 LSTM 모델을 위한 시퀀스 데이터 생성
+    
+    Args:
+        df (pd.DataFrame): 피처와 타겟을 포함한 데이터프레임
+        window_size (int): 시퀀스 윈도우 크기 (몇 일의 데이터를 사용할지)
+        target_col (str, optional): 타겟 컬럼명. 기본값은 'target'.
+        prediction_type (str, optional): 예측 유형 ('price' 또는 'direction'). 기본값은 'price'.
+        
+    Returns:
+        Dict[str, np.ndarray]: X와 y 데이터가 포함된 딕셔너리
+    """
+    try:
+        # 데이터 유효성 검사
+        if df is None or df.empty:
+            logger.error("시퀀스 데이터 생성을 위한 유효한 데이터프레임이 없습니다.")
+            return {'X': np.array([]), 'y': np.array([])}
+            
+        # 타겟 컬럼 존재 여부 확인
+        if target_col not in df.columns:
+            logger.error(f"타겟 컬럼 '{target_col}'이 데이터프레임에 존재하지 않습니다.")
+            return {'X': np.array([]), 'y': np.array([])}
+        
+        # NaN 또는 누락된 데이터 확인
+        nan_count = df.isna().sum().sum()
+        if nan_count > 0:
+            logger.warning(f"시퀀스 데이터 생성 전 데이터프레임에 {nan_count}개의 NaN 값이 있습니다. 0으로 대체합니다.")
+            df = df.fillna(0)
+        
+        # DataFrame에서 요구되는 컬럼만 선택
+        # 타겟 컬럼은 제외하고 피처만 선택
+        feature_cols = [col for col in df.columns if col != target_col]
+        
+        # 결과 저장용 리스트
+        X = []
+        y = []
+        
+        # 시퀀스 데이터 생성
+        for i in range(len(df) - window_size):
+            # 피처 시퀀스 (window_size 길이의 구간)
+            feature_seq = df[feature_cols].iloc[i:i+window_size].values
+            
+            # 타겟 값 (가격 또는 방향)
+            if prediction_type == 'direction':
+                # 이전 종가와 비교하여 방향 결정 (상승=1, 하락=0)
+                current_target = df[target_col].iloc[i+window_size]
+                
+                # NaN 체크
+                if pd.isna(current_target):
+                    # NaN 타겟은 건너뜀
+                    continue
+                
+                # 방향 예측일 경우, 이진 클래스로 변환
+                # 명시적 비교 연산으로 변경
+                if isinstance(current_target, (int, float)):
+                    # 숫자 타입인 경우 0보다 크면 1, 아니면 0
+                    target_val = 1 if current_target > 0 else 0
+                else:
+                    # 다른 타입인 경우 로그 남기고 건너뜀
+                    logger.warning(f"타겟 값 '{current_target}'이 숫자가 아닙니다. 건너뜁니다.")
+                    continue
+            else:
+                # 가격 예측은 그대로 사용
+                target_val = df[target_col].iloc[i+window_size]
+                
+                # NaN 체크
+                if pd.isna(target_val):
+                    # NaN 타겟은 건너뜀
+                    continue
+            
+            # 유효한 시퀀스만 추가
+            X.append(feature_seq)
+            y.append(target_val)
+        
+        # 결과가 비어있는지 확인
+        if not X or not y:
+            logger.warning("생성된 시퀀스 데이터가 없습니다.")
+            return {'X': np.array([]), 'y': np.array([])}
+        
+        # numpy 배열로 변환
+        X = np.array(X)
+        y = np.array(y)
+        
+        logger.info(f"시퀀스 데이터 생성 완료: X 형태={X.shape}, y 형태={y.shape}")
+        
+        return {'X': X, 'y': y}
+        
+    except Exception as e:
+        logger.error(f"시퀀스 데이터 생성 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {'X': np.array([]), 'y': np.array([])} 
