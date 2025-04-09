@@ -11,11 +11,12 @@ from typing import Dict, List, Union, Optional, Tuple, Any
 from datetime import datetime, timedelta
 import ta
 from ta.trend import SMAIndicator, EMAIndicator, MACD, CCIIndicator, ADXIndicator, AroonIndicator
-from ta.momentum import RSIIndicator, StochasticOscillator, TSIIndicator, WilliamsRIndicator, AwesomeOscillatorIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator, TSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel
 from ta.volume import OnBalanceVolumeIndicator, MFIIndicator, AccDistIndexIndicator, VolumeWeightedAveragePrice
 from ta.others import DailyReturnIndicator
 from sklearn.preprocessing import StandardScaler
+from ta.momentum import WilliamsRIndicator, AwesomeOscillatorIndicator
 
 from config import settings
 from utils.logging import get_logger, log_execution
@@ -31,11 +32,11 @@ ALL_POSSIBLE_INDICATOR_COLUMNS = [
     'rsi14', 'bb_upper', 'bb_middle', 'bb_lower', 'stoch_k', 'stoch_d', 'atr', 'obv',
     'daily_return', 'volatility_14',
     # Advanced Indicators
-    'cci', 'tsi', 'mfi', 'adi', 'roc', 'ichimoku_tenkan_sen',
+    'cci', 'tsi', 'mfi', 'adi', 'roc10', 'ichimoku_tenkan_sen',
     'ichimoku_kijun_sen', 'ichimoku_senkou_span_a', 'ichimoku_senkou_span_b', 'ichimoku_chikou_span',
     'keltner_mband', 'keltner_hband', 'keltner_lband', 'hma9', 'ao', 'williams_r', 'vwap',
     # Custom Indicators
-    'volume_change', 'price_volume_corr', 'market_breadth', 'volatility_ratio', 'trend_strength',
+    'volume_change_1', 'price_change_1', 'price_volume_corr', 'market_breadth', 'volatility_ratio', 'trend_strength',
     # Pattern Recognition (using actual implemented function names)
     'doji',           # Previously CDLDOJI
     'hammer',         # Previously CDLHAMMER (includes hanging man as -1)
@@ -48,280 +49,453 @@ ALL_POSSIBLE_INDICATOR_COLUMNS = [
 ]
 
 @log_execution
-def add_basic_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_price_volume_correlation(df: pd.DataFrame, window: int = 20) -> pd.Series:
     """
-    Add basic technical indicators to DataFrame
+    안전하게 가격과 거래량 간의 상관관계를 계산하는 함수
     
     Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
+        df (pd.DataFrame): OHLCV 데이터가 포함된 데이터프레임
+        window (int): 상관관계 계산을 위한 윈도우 크기
         
     Returns:
-        pd.DataFrame: DataFrame with added indicators
+        pd.Series: 가격과 거래량 간의 상관관계 시리즈
     """
-    # Make a copy to avoid modifying the original
-    result = df.copy()
-    
     try:
-        # Add simple moving averages
-        result['sma7'] = SMAIndicator(close=result['close'], window=7).sma_indicator()
-        result['sma25'] = SMAIndicator(close=result['close'], window=25).sma_indicator()
-        result['sma99'] = SMAIndicator(close=result['close'], window=99).sma_indicator()
+        # 입력 데이터 확인 및 변환
+        if 'close' not in df.columns or 'volume' not in df.columns:
+            logger.warning("가격-거래량 상관관계 계산을 위한 필수 컬럼이 없습니다.")
+            return pd.Series(np.nan, index=df.index)
+            
+        # 숫자형으로 변환
+        close = pd.to_numeric(df['close'], errors='coerce')
+        volume = pd.to_numeric(df['volume'], errors='coerce')
         
-        # Add exponential moving averages
-        result['ema12'] = EMAIndicator(close=result['close'], window=12).ema_indicator()
-        result['ema26'] = EMAIndicator(close=result['close'], window=26).ema_indicator()
-        result['ema200'] = EMAIndicator(close=result['close'], window=200).ema_indicator()
+        # 데이터 유효성 검사
+        if close.isna().all() or volume.isna().all():
+            logger.warning("가격 또는 거래량 데이터가 모두 NaN입니다.")
+            return pd.Series(np.nan, index=df.index)
+            
+        # 변화율 계산 (상관관계는 가격이 아닌 변화율로 계산하는 것이 더 의미 있음)
+        close_changes = close.pct_change().fillna(0)
+        volume_changes = volume.pct_change().fillna(0)
         
-        # MACD (Moving Average Convergence Divergence)
-        macd = MACD(close=result['close'], window_slow=26, window_fast=12, window_sign=9)
-        result['macd'] = macd.macd()
-        result['macd_signal'] = macd.macd_signal()
-        result['macd_diff'] = macd.macd_diff()
+        # 무한값 처리
+        close_changes = close_changes.replace([np.inf, -np.inf], np.nan)
+        volume_changes = volume_changes.replace([np.inf, -np.inf], np.nan)
         
-        # RSI (Relative Strength Index)
-        result['rsi14'] = RSIIndicator(close=result['close'], window=14).rsi()
+        # 상관관계 시리즈 초기화
+        correlation = pd.Series(np.nan, index=df.index)
         
-        # Bollinger Bands
-        bollinger = BollingerBands(close=result['close'], window=20, window_dev=2)
-        result['bb_upper'] = bollinger.bollinger_hband()
-        result['bb_middle'] = bollinger.bollinger_mavg()
-        result['bb_lower'] = bollinger.bollinger_lband()
+        # 롤링 윈도우로 상관관계 계산
+        for i in range(window, len(df) + 1):
+            window_close = close_changes.iloc[i-window:i]
+            window_volume = volume_changes.iloc[i-window:i]
+            
+            # 데이터 유효성 확인
+            if window_close.isna().all() or window_volume.isna().all():
+                correlation.iloc[i-1] = np.nan
+                continue
+                
+            # 결측치 제거
+            valid_data = pd.concat([window_close, window_volume], axis=1).dropna()
+            if len(valid_data) <= 1:  # 최소 2개 이상의 데이터 필요
+                correlation.iloc[i-1] = np.nan
+                continue
+                
+            # 표준편차 확인 (0인 경우 상관관계 계산 불가)
+            close_std = valid_data.iloc[:, 0].std()
+            volume_std = valid_data.iloc[:, 1].std()
+            
+            if close_std == 0 or volume_std == 0 or np.isnan(close_std) or np.isnan(volume_std):
+                correlation.iloc[i-1] = 0  # 표준편차가 0이면 상관관계 0으로 설정
+                # 표준편차가 0인 경우 로그 추가
+                logger.debug(f"표준편차가 0 또는 NaN: close_std={close_std}, volume_std={volume_std}, 인덱스: {i-1}")
+                continue
+                
+            # np.corrcoef 대신 pandas의 corr() 메서드를 사용하여 안전하게 계산
+            try:
+                corr_value = valid_data.iloc[:, 0].corr(valid_data.iloc[:, 1])
+                correlation.iloc[i-1] = corr_value if not np.isnan(corr_value) else 0
+            except Exception as corr_err:
+                logger.debug(f"상관관계 계산 중 오류: {corr_err} (인덱스: {i-1})")
+                correlation.iloc[i-1] = 0
         
-        # Stochastic Oscillator
-        stoch = StochasticOscillator(high=result['high'], low=result['low'], close=result['close'], window=14, smooth_window=3)
-        result['stoch_k'] = stoch.stoch()
-        result['stoch_d'] = stoch.stoch_signal()
+        # NaN 값을 0으로 채우기
+        correlation = correlation.fillna(0)
         
-        # Average True Range (ATR)
-        result['atr'] = AverageTrueRange(high=result['high'], low=result['low'], close=result['close'], window=14).average_true_range()
+        return correlation
         
-        # On-balance Volume
-        result['obv'] = OnBalanceVolumeIndicator(close=result['close'], volume=result['volume']).on_balance_volume()
-        
-        # Calculate daily returns
-        result['daily_return'] = DailyReturnIndicator(close=result['close']).daily_return()
-        
-        # Volatility
-        result['volatility_14'] = result['close'].pct_change().rolling(window=14).std()
-        
-        logger.info("Successfully added basic indicators")
-        
-        return result
-    
     except Exception as e:
-        logger.error(f"Error adding basic indicators: {str(e)}")
-        return df  # Return original DataFrame if error
+        logger.error(f"가격-거래량 상관관계 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(0, index=df.index)  # 오류 발생 시 0으로 채워진 시리즈 반환
 
+@log_execution
+def add_basic_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    기본 기술적 지표를 데이터프레임에 추가합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLCV 데이터가 포함된 데이터프레임
+        
+    Returns:
+        pd.DataFrame: 기본 지표가 추가된 데이터프레임
+    """
+    try:
+        # 단순이동평균 (SMA)
+        df['sma7'] = df['close'].rolling(window=7, min_periods=1).mean()
+        df['sma25'] = df['close'].rolling(window=25, min_periods=1).mean()
+        df['sma50'] = df['close'].rolling(window=50, min_periods=1).mean()
+        df['sma100'] = df['close'].rolling(window=100, min_periods=1).mean()
+        df['sma200'] = df['close'].rolling(window=200, min_periods=1).mean()
+        
+        # 지수이동평균 (EMA)
+        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+        df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+        
+        # 볼린저 밴드 (Bollinger Bands)
+        middle_band = df['close'].rolling(window=20, min_periods=1).mean()
+        std_dev = df['close'].rolling(window=20, min_periods=1).std()
+        df['bb_upper'] = middle_band + (std_dev * 2)
+        df['bb_middle'] = middle_band
+        df['bb_lower'] = middle_band - (std_dev * 2)
+        
+        # RSI
+        df['rsi14'] = calculate_rsi(df['close'], period=14)
+        
+        # MACD
+        macd_line = df['ema12'] - df['ema26']
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        df['macd'] = macd_line
+        df['macd_signal'] = signal_line
+        df['macd_diff'] = macd_line - signal_line
+        
+        # 스토캐스틱 (Stochastic Oscillator)
+        df['stoch_k'] = calculate_stochastic(df, period=14)
+        df['stoch_d'] = df['stoch_k'].rolling(window=3, min_periods=1).mean()
+        
+        # ATR (Average True Range)
+        df['atr'] = calculate_atr(df, period=14)
+        
+        # OBV (On-Balance Volume)
+        df['obv'] = calculate_obv(df)
+        
+        # 일일 수익률
+        df['daily_return'] = df['close'].pct_change()
+        
+        logger.info("기본 지표 계산 완료")
+        return df
+    except Exception as e:
+        logger.error(f"기본 지표 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return df  # 오류 발생 시 원본 데이터프레임 반환
 
 @log_execution
 def add_advanced_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add advanced technical indicators to DataFrame
+    고급 기술적 지표를 데이터프레임에 추가합니다.
     
     Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
+        df (pd.DataFrame): 기본 지표가 포함된 데이터프레임
         
     Returns:
-        pd.DataFrame: DataFrame with added indicators
+        pd.DataFrame: 고급 지표가 추가된 데이터프레임
     """
-    # Make a copy to avoid modifying the original
-    result = df.copy()
-    
-    # --- Input Data Validation and Type Conversion Start ---
-    logger.debug(f"Entering add_advanced_indicators. Validating input df. Shape: {result.shape}")
     try:
-        # 1. Ensure index is DatetimeIndex
-        if not isinstance(result.index, pd.DatetimeIndex):
-            logger.warning(f"Input index is {type(result.index)}, attempting to convert to DatetimeIndex.")
-            result.index = pd.to_datetime(result.index, errors='coerce')
-            # Drop rows where index conversion failed
-            original_len = len(result)
-            result = result.dropna(axis=0, subset=[result.index.name] if result.index.name else None) 
-            if len(result) < original_len:
-                logger.warning(f"Dropped {original_len - len(result)} rows due to invalid index after conversion.")
+        # 추가 RSI 기간
+        df['rsi7'] = calculate_rsi(df['close'], period=7)
+        df['rsi21'] = calculate_rsi(df['close'], period=21)
         
-        if result.empty or not isinstance(result.index, pd.DatetimeIndex):
-             logger.error("Index conversion failed or resulted in empty DataFrame. Cannot proceed.")
-             return df # Return original df
-
-        # 2. Ensure required columns exist and are numeric
-        required_cols = ['high', 'low', 'close', 'volume']
-        missing_cols = [col for col in required_cols if col not in result.columns]
-        if missing_cols:
-            logger.error(f"Missing required columns: {missing_cols}. Cannot proceed.")
-            return df # Return original df
-            
-        for col in required_cols:
-            if not pd.api.types.is_numeric_dtype(result[col]):
-                logger.warning(f"Column '{col}' is {result[col].dtype}, attempting to convert to numeric.")
-                original_type = result[col].dtype
-                result[col] = pd.to_numeric(result[col], errors='coerce')
-                # Check how many NaNs were introduced
-                nan_count = result[col].isnull().sum()
-                if nan_count > 0:
-                    logger.warning(f"Conversion of '{col}' (from {original_type}) introduced {nan_count} NaNs.")
+        # 추가 이동평균
+        df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+        df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
         
-        # Optional: Handle NaNs introduced during conversion if necessary, though later steps might handle them.
-        # For now, we assume subsequent indicator calculations or NaN handling steps will manage them.
+        # 파라볼릭 SAR
+        df['psar'] = calculate_parabolic_sar(df)
         
-        logger.debug(f"Input df validated. Index type: {type(result.index)}, Shape after validation: {result.shape}")
-        logger.debug(f"  Column dtypes: high={result['high'].dtype}, low={result['low'].dtype}, close={result['close'].dtype}, volume={result['volume'].dtype}")
+        # ADX
+        df['adx'] = calculate_adx(df)
         
-    except Exception as validation_e:
-        logger.error(f"Error during input data validation/conversion: {validation_e}")
-        logger.error(traceback.format_exc())
-        return df # Return original df on validation error
-    # --- Input Data Validation and Type Conversion End ---
-    
-    try:
-        logger.debug("Calculating CCI...")
-        result['cci'] = CCIIndicator(high=result['high'], low=result['low'], close=result['close'], window=20).cci()
-        logger.debug("CCI calculated.")
+        # Ichimoku Cloud 컴포넌트
+        ichimoku = calculate_ichimoku(df)
+        if not ichimoku.empty and not ichimoku.isnull().all().all():
+            df = pd.concat([df, ichimoku], axis=1)
         
-        logger.debug("Calculating TSI...")
-        result['tsi'] = TSIIndicator(close=result['close'], window_slow=25, window_fast=13).tsi()
-        logger.debug("TSI calculated.")
+        # Keltner Channel
+        keltner = calculate_keltner_channel(df)
+        if not keltner.empty and not keltner.isnull().all().all():
+            df = pd.concat([df, keltner], axis=1)
         
-        logger.debug("Calculating MFI...")
-        result['mfi'] = MFIIndicator(high=result['high'], low=result['low'], close=result['close'], 
-                                     volume=result['volume'], window=14).money_flow_index()
-        logger.debug("MFI calculated.")
+        # Williams %R
+        df['williams_r'] = calculate_williams_r(df)
         
-        logger.debug("Calculating ADI...")
-        result['adi'] = AccDistIndexIndicator(high=result['high'], low=result['low'], close=result['close'], 
-                                               volume=result['volume']).acc_dist_index()
-        logger.debug("ADI calculated.")
+        # CCI (Commodity Channel Index)
+        df['cci'] = calculate_cci(df)
         
-        logger.debug("Calculating ROC (10)...") # ROC(10) 추가
-        result['roc10'] = calculate_rate_of_change(result['close'], 10)
-        logger.debug("ROC (10) calculated.")
+        # Chaikin Oscillator
+        df['chaikin_oscillator'] = calculate_chaikin_oscillator(df)
         
-        logger.debug("Calculating Ichimoku Cloud...")
-        # Check dtypes before calling calculate_ichimoku
-        logger.debug(f"  Ichimoku input dtypes: high={result['high'].dtype}, low={result['low'].dtype}, close={result['close'].dtype}")
-        ichimoku = calculate_ichimoku(result)
-        logger.debug("Ichimoku calculated. Merging...")
-        result = pd.concat([result, ichimoku], axis=1)
-        logger.debug("Ichimoku merged.")
-        # Log dtypes after Ichimoku merge
-        logger.debug(f"  Dtypes after Ichimoku:\n{result[['high', 'low', 'close']].dtypes}")
-
-        logger.debug("Calculating Keltner Channel...")
-        # Check dtypes before calling calculate_keltner_channel
-        logger.debug(f"  Keltner input dtypes: high={result['high'].dtype}, low={result['low'].dtype}, close={result['close'].dtype}")
-        keltner = calculate_keltner_channel(result)
-        logger.debug("Keltner calculated. Merging...")
-        result = pd.concat([result, keltner], axis=1)
-        logger.debug("Keltner merged.")
-        # Log dtypes after Keltner merge
-        logger.debug(f"  Dtypes after Keltner:\n{result[['high', 'low', 'close']].dtypes}")
-
-        logger.debug("Calculating Hull MA...")
-        # Add try-except for HMA
-        try:
-            result['hma9'] = calculate_hull_ma(result['close'], 9)
-            logger.debug("Hull MA calculated.")
-            # Log dtypes after Hull MA calculation
-            logger.debug(f"  Dtypes after Hull MA:\n{result[['high', 'low', 'close']].dtypes}")
-        except Exception as e_hma:
-            logger.warning(f"Error calculating Hull MA: {e_hma}")
-            result['hma9'] = np.nan
-
-        logger.debug("Calculating Awesome Oscillator...")
-        # Check dtypes before calling calculate_awesome_oscillator
-        logger.debug(f"  AO input dtypes: high={result['high'].dtype}, low={result['low'].dtype}")
-        # Corrected try-except block for AO
-        try:
-            result['ao'] = calculate_awesome_oscillator(result)
-            logger.debug("Awesome Oscillator calculated.")
-            # Log dtypes after AO calculation
-            logger.debug(f"  Dtypes after AO:\n{result[['high', 'low', 'close']].dtypes}")
-        except Exception as e_ao:
-            logger.warning(f"Error calculating Awesome Oscillator: {e_ao}")
-            result['ao'] = np.nan # Set to NaN on error
+        # CMF (Chaikin Money Flow)
+        df['cmf'] = calculate_cmf(df['high'], df['low'], df['close'], df['volume'])
         
-        logger.debug("Calculating Williams %R...")
-        # Check dtypes before calling calculate_williams_r
-        logger.debug(f"  Williams %R input dtypes: high={result['high'].dtype}, low={result['low'].dtype}, close={result['close'].dtype}")
-        # Add try-except for Williams %R as well
-        try:
-            result['williams_r'] = calculate_williams_r(result)
-            logger.debug("Williams %R calculated.")
-        except Exception as e_wr:
-            logger.warning(f"Error calculating Williams %R: {e_wr}")
-            result['williams_r'] = np.nan # Set to NaN on error
+        # MFI (Money Flow Index)
+        df['mfi'] = calculate_mfi(df)
         
-        logger.debug("Calculating VWAP...")
-        # Check dtypes before calling calculate_vwap
-        logger.debug(f"  VWAP input dtypes: high={result['high'].dtype}, low={result['low'].dtype}, close={result['close'].dtype}, volume={result['volume'].dtype}")
-        result['vwap'] = calculate_vwap(result)
-        logger.debug("VWAP calculated.")
+        # 모멘텀 지표
+        df['roc'] = calculate_rate_of_change(df['close'], 10)
         
-        logger.debug("Calculating ADX (14)...") # ADX(14) 추가
-        try: # ADX 계산 오류 처리 추가
-            adx_indicator = ADXIndicator(high=result['high'], low=result['low'], close=result['close'], window=14, fillna=True)
-            result['adx14'] = adx_indicator.adx()
-            # Optionally add +DI and -DI if needed
-            # result['adx_pos'] = adx_indicator.adx_pos()
-            # result['adx_neg'] = adx_indicator.adx_neg()
-            logger.debug("ADX (14) calculated.")
-        except Exception as e_adx:
-            logger.warning(f"Error calculating ADX (14): {e_adx}")
-            result['adx14'] = np.nan
-
-        logger.debug("Calculating Bollinger Bands %B (20)...") # %B(20) 추가
-        result['bb_percent_b20'] = calculate_percent_b(high=result['high'], low=result['low'], close=result['close'], window=20, window_dev=2)
-        logger.debug("Bollinger Bands %B (20) calculated.")
-
-        logger.debug("Calculating Chaikin Money Flow (20)...") # CMF(20) 추가
-        result['cmf20'] = calculate_cmf(high=result['high'], low=result['low'], close=result['close'], volume=result['volume'], window=20)
-        logger.debug("Chaikin Money Flow (20) calculated.")
-
-        logger.debug("Calculating EMA Distance Norm (12, 26)...") # EMA 거리 정규화 추가
-        result['ema12_ema26_dist_norm'] = calculate_ema_dist_norm(close=result['close'], window_fast=12, window_slow=26)
-        logger.debug("EMA Distance Norm (12, 26) calculated.")
-
-        # ... (기존 HMA, AO, Williams %R 등 계산) ...
-
-        # --- Add pct_change calculations ---
-        logger.debug("Calculating Price and Volume Change (1 period)...")
-        # Ensure close and volume are numeric before pct_change
-        close_numeric = pd.to_numeric(result['close'], errors='coerce')
-        volume_numeric = pd.to_numeric(result['volume'], errors='coerce')
-        result['price_change_1'] = close_numeric.pct_change(periods=1)
-        result['volume_change_1'] = volume_numeric.pct_change(periods=1)
-        # Fill initial NaNs created by pct_change and potential division by zero
-        result['price_change_1'] = result['price_change_1'].replace([np.inf, -np.inf], np.nan).fillna(0)
-        result['volume_change_1'] = result['volume_change_1'].replace([np.inf, -np.inf], np.nan).fillna(0)
-        logger.debug("Price and Volume Change (1 period) calculated.")
-        # --- End pct_change calculations ---
-
-        # Final NaN check and fill for all added indicators
-        # ... (기존 NaN 처리 로직) ...
-        # Consolidate NaN filling here after all indicators are added
-        indicator_cols = result.columns.difference(df.columns) # Get newly added columns
-        result[indicator_cols] = result[indicator_cols].fillna(method='ffill').fillna(method='bfill')
-        # Fill any remaining NaNs (e.g., at the very beginning) with 0 or another appropriate value
-        result[indicator_cols] = result[indicator_cols].fillna(0)
-
-        logger.info("Successfully added advanced indicators")
+        # Awesome Oscillator
+        df['awesome_oscillator'] = calculate_awesome_oscillator(df)
         
-        return result
-    
+        logger.info("고급 지표 계산 완료")
+        return df
     except Exception as e:
-        # --- Enhanced Traceback Logging ---
-        error_msg = f"Error adding advanced indicators: {str(e)}"
-        logger.error(error_msg)
-        try:
-            tb_str = traceback.format_exc()
-            logger.error("--- Traceback Start ---")
-            logger.error(tb_str) # Log the full traceback
-            logger.error("--- Traceback End ---")
-        except Exception as tb_e:
-            logger.error(f"Could not format or log traceback: {tb_e}")
-        # --- End Enhanced Traceback Logging ---
-        return df # Return original DataFrame if error
+        logger.error(f"고급 지표 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return df  # 오류 발생 시 원본 데이터프레임 반환
 
+@log_execution
+def add_custom_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    사용자 정의 기술적 지표를 데이터프레임에 추가합니다.
+    
+    Args:
+        df (pd.DataFrame): 기본 및 고급 지표가 포함된 데이터프레임
+        
+    Returns:
+        pd.DataFrame: 사용자 정의 지표가 추가된 데이터프레임
+    """
+    try:
+        # 볼리전 밴드 %B
+        if all(col in df.columns for col in ['high', 'low', 'close']):
+            df['percent_b'] = calculate_percent_b(df['high'], df['low'], df['close'])
+        
+        # 이동평균 변화율
+        if 'ema9' in df.columns and 'ema21' in df.columns:
+            df['ema_ratio'] = (df['ema9'] / df['ema21']) - 1
+        
+        # 상대 강도 (RS)
+        if 'rsi14' in df.columns:
+            # RSI 공식에서 RS = 100 / (100 - RSI) - 1
+            df['rs'] = 100 / (100 - df['rsi14']) - 1
+        
+        # 변동성 비율
+        if 'atr' in df.columns and 'close' in df.columns:
+            df['volatility_ratio'] = df['atr'] / df['close'] * 100
+        
+        # 이동평균 교차 신호
+        if 'ema12' in df.columns and 'ema26' in df.columns:
+            # 0보다 크면 골든 크로스, 작으면 데드 크로스
+            df['ema_cross'] = df['ema12'] - df['ema26']
+            df['ema_cross_signal'] = np.where(df['ema_cross'] > 0, 1, np.where(df['ema_cross'] < 0, -1, 0))
+        
+        # 추세 강도 지표
+        if 'adx' in df.columns:
+            df['trend_strength'] = np.where(df['adx'] > 25, 1, np.where(df['adx'] < 20, -1, 0))
+        
+        # 가격 추세 방향
+        if 'close' in df.columns and 'ema50' in df.columns:
+            df['price_trend'] = np.where(df['close'] > df['ema50'], 1, np.where(df['close'] < df['ema50'], -1, 0))
+        
+        # 통합 모멘텀 지표
+        momentum_cols = ['rsi14', 'macd', 'stoch_k']
+        if all(col in df.columns for col in momentum_cols):
+            # RSI 기준: 30 미만은 과매도, 70 초과는 과매수
+            rsi_signal = np.where(df['rsi14'] < 30, 1, np.where(df['rsi14'] > 70, -1, 0))
+            
+            # MACD 기준: 0보다 크면 상승, 작으면 하락
+            macd_signal = np.where(df['macd'] > 0, 1, np.where(df['macd'] < 0, -1, 0))
+            
+            # 스토캐스틱 기준: 20 미만은 과매도, 80 초과는 과매수
+            stoch_signal = np.where(df['stoch_k'] < 20, 1, np.where(df['stoch_k'] > 80, -1, 0))
+            
+            # 통합 모멘텀 (-3 ~ 3 범위)
+            df['combined_momentum'] = rsi_signal + macd_signal + stoch_signal
+        
+        logger.info("사용자 정의 지표 계산 완료")
+        return df
+    except Exception as e:
+        logger.error(f"사용자 정의 지표 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return df  # 오류 발생 시 원본 데이터프레임 반환
+
+@log_execution
+def add_pattern_recognition(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    캔들스틱 패턴 인식 결과를 데이터프레임에 추가합니다.
+    
+    Args:
+        df (pd.DataFrame): 기술적 지표가 포함된 데이터프레임
+        
+    Returns:
+        pd.DataFrame: 패턴 인식 결과가 추가된 데이터프레임
+    """
+    try:
+        required_cols = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.warning(f"캔들스틱 패턴 인식에 필요한 컬럼({required_cols}) 없음. 패턴 인식 스킵.")
+            return df
+            
+        # 간단한 패턴 인식 구현
+        # 도지 패턴
+        df['pattern_doji'] = np.where(
+            abs(df['close'] - df['open']) / (df['high'] - df['low'] + 1e-8) < 0.1,
+            100,  # 존재하면 100 (또는 양수 값)
+            0     # 없으면 0
+        )
+        
+        # 해머 패턴 (간단 구현)
+        df['pattern_hammer'] = np.where(
+            (df['close'] > df['open']) &  # 양봉
+            ((df['high'] - df['close']) < 0.2 * (df['high'] - df['low'] + 1e-8)) &  # 위쪽 꼬리가 짧음
+            ((df['open'] - df['low']) > 0.6 * (df['high'] - df['low'] + 1e-8)),  # 아래쪽 꼬리가 긺
+            100,
+            0
+        )
+        
+        # 행잉맨 패턴 (간단 구현)
+        df['pattern_hanging_man'] = np.where(
+            (df['close'] < df['open']) &  # 음봉
+            ((df['high'] - df['open']) < 0.2 * (df['high'] - df['low'] + 1e-8)) &  # 위쪽 꼬리가 짧음
+            ((df['close'] - df['low']) > 0.6 * (df['high'] - df['low'] + 1e-8)),  # 아래쪽 꼬리가 긺
+            -100,
+            0
+        )
+        
+        # 슈팅스타 패턴 (간단 구현)
+        df['pattern_shooting_star'] = np.where(
+            (df['close'] < df['open']) &  # 음봉
+            ((df['high'] - df['open']) > 0.6 * (df['high'] - df['low'] + 1e-8)) &  # 위쪽 꼬리가 긺
+            ((df['close'] - df['low']) < 0.2 * (df['high'] - df['low'] + 1e-8)),  # 아래쪽 꼬리가 짧음
+            -100,
+            0
+        )
+        
+        # 엥걸핑 패턴 (간단 구현)
+        engulfing_values = np.zeros(len(df))
+        for i in range(1, len(df)):
+            # 양봉 엥걸핑 (매수 신호)
+            if (df['close'].iloc[i] > df['open'].iloc[i] and
+                df['close'].iloc[i-1] < df['open'].iloc[i-1] and
+                df['close'].iloc[i] > df['open'].iloc[i-1] and
+                df['open'].iloc[i] < df['close'].iloc[i-1]):
+                engulfing_values[i] = 100
+            # 음봉 엥걸핑 (매도 신호)
+            elif (df['close'].iloc[i] < df['open'].iloc[i] and
+                df['close'].iloc[i-1] > df['open'].iloc[i-1] and
+                df['close'].iloc[i] < df['open'].iloc[i-1] and
+                df['open'].iloc[i] > df['close'].iloc[i-1]):
+                engulfing_values[i] = -100
+        df['pattern_engulfing'] = engulfing_values
+        
+        # 모닝스타 패턴 (간단 구현)
+        morning_star_values = np.zeros(len(df))
+        for i in range(2, len(df)):
+            # 첫번째 캔들: 큰 음봉
+            # 두번째 캔들: 작은 몸통
+            # 세번째 캔들: 큰 양봉
+            if (df['close'].iloc[i-2] < df['open'].iloc[i-2] and  # 첫번째 캔들 음봉
+                abs(df['close'].iloc[i-1] - df['open'].iloc[i-1]) < 0.3 * abs(df['close'].iloc[i-2] - df['open'].iloc[i-2]) and  # 두번째 캔들 작은 몸통
+                df['close'].iloc[i] > df['open'].iloc[i] and  # 세번째 캔들 양봉
+                df['close'].iloc[i] > (df['open'].iloc[i-2] + df['close'].iloc[i-2]) / 2):  # 세번째 캔들이 첫번째 캔들의 중간 이상 상승
+                morning_star_values[i] = 100
+        df['pattern_morning_star'] = morning_star_values
+        
+        # 이브닝스타 패턴 (간단 구현)
+        evening_star_values = np.zeros(len(df))
+        for i in range(2, len(df)):
+            # 첫번째 캔들: 큰 양봉
+            # 두번째 캔들: 작은 몸통
+            # 세번째 캔들: 큰 음봉
+            if (df['close'].iloc[i-2] > df['open'].iloc[i-2] and  # 첫번째 캔들 양봉
+                abs(df['close'].iloc[i-1] - df['open'].iloc[i-1]) < 0.3 * abs(df['close'].iloc[i-2] - df['open'].iloc[i-2]) and  # 두번째 캔들 작은 몸통
+                df['close'].iloc[i] < df['open'].iloc[i] and  # 세번째 캔들 음봉
+                df['close'].iloc[i] < (df['open'].iloc[i-2] + df['close'].iloc[i-2]) / 2):  # 세번째 캔들이 첫번째 캔들의 중간 이하로 하락
+                evening_star_values[i] = -100
+        df['pattern_evening_star'] = evening_star_values
+        
+        # 쓰리 화이트 솔저스 (간단 구현)
+        three_white_soldiers_values = np.zeros(len(df))
+        for i in range(2, len(df)):
+            # 세 개의 연속적인 양봉, 각 캔들의 시가가 이전 캔들의 몸통 내에 있음
+            if (df['close'].iloc[i-2] > df['open'].iloc[i-2] and  # 첫번째 캔들 양봉
+                df['close'].iloc[i-1] > df['open'].iloc[i-1] and  # 두번째 캔들 양봉
+                df['close'].iloc[i] > df['open'].iloc[i] and  # 세번째 캔들 양봉
+                df['open'].iloc[i-1] > df['open'].iloc[i-2] and  # 두번째 캔들 시가 > 첫번째 캔들 시가
+                df['open'].iloc[i] > df['open'].iloc[i-1] and  # 세번째 캔들 시가 > 두번째 캔들 시가
+                df['close'].iloc[i-1] > df['close'].iloc[i-2] and  # 두번째 캔들 종가 > 첫번째 캔들 종가
+                df['close'].iloc[i] > df['close'].iloc[i-1]):  # 세번째 캔들 종가 > 두번째 캔들 종가
+                three_white_soldiers_values[i] = 100
+        df['pattern_three_white_soldiers'] = three_white_soldiers_values
+        
+        # 쓰리 블랙 크로우즈 (간단 구현)
+        three_black_crows_values = np.zeros(len(df))
+        for i in range(2, len(df)):
+            # 세 개의 연속적인 음봉, 각 캔들의 시가가 이전 캔들의 몸통 내에 있음
+            if (df['close'].iloc[i-2] < df['open'].iloc[i-2] and  # 첫번째 캔들 음봉
+                df['close'].iloc[i-1] < df['open'].iloc[i-1] and  # 두번째 캔들 음봉
+                df['close'].iloc[i] < df['open'].iloc[i] and  # 세번째 캔들 음봉
+                df['open'].iloc[i-1] < df['open'].iloc[i-2] and  # 두번째 캔들 시가 < 첫번째 캔들 시가
+                df['open'].iloc[i] < df['open'].iloc[i-1] and  # 세번째 캔들 시가 < 두번째 캔들 시가
+                df['close'].iloc[i-1] < df['close'].iloc[i-2] and  # 두번째 캔들 종가 < 첫번째 캔들 종가
+                df['close'].iloc[i] < df['close'].iloc[i-1]):  # 세번째 캔들 종가 < 두번째 캔들 종가
+                three_black_crows_values[i] = -100
+        df['pattern_three_black_crows'] = three_black_crows_values
+        
+        # 추세 확인 컬럼 추가
+        if 'ema50' in df.columns:
+            uptrend = df['close'] > df['ema50']
+            
+            # 패턴 신호 강도 조정 (추세와 일치하면 강화, 아니면 약화)
+            for col in df.columns:
+                if col.startswith('pattern_'):
+                    # 매수 신호 (양수)와 상승 추세가 일치하면 신호 강화 (1.5배)
+                    df[col] = np.where(
+                        (df[col] > 0) & uptrend,
+                        df[col] * 1.5,
+                        df[col]
+                    )
+                    
+                    # 매도 신호 (음수)와 하락 추세가 일치하면 신호 강화 (1.5배)
+                    df[col] = np.where(
+                        (df[col] < 0) & (~uptrend),
+                        df[col] * 1.5,
+                        df[col]
+                    )
+                    
+                    # 매수 신호와 하락 추세가 충돌하면 신호 약화 (0.5배)
+                    df[col] = np.where(
+                        (df[col] > 0) & (~uptrend),
+                        df[col] * 0.5,
+                        df[col]
+                    )
+                    
+                    # 매도 신호와 상승 추세가 충돌하면 신호 약화 (0.5배)
+                    df[col] = np.where(
+                        (df[col] < 0) & uptrend,
+                        df[col] * 0.5,
+                        df[col]
+                    )
+        
+        # 통합 패턴 신호
+        pattern_cols = [col for col in df.columns if col.startswith('pattern_')]
+        if pattern_cols:
+            df['pattern_signal'] = df[pattern_cols].sum(axis=1)
+            
+            # 신호를 -100 ~ +100 범위로 정규화
+            max_signal = np.abs(df['pattern_signal']).max()
+            if max_signal > 0:
+                df['pattern_signal'] = df['pattern_signal'] * (100 / max_signal)
+        
+        logger.info("패턴 인식 계산 완료")
+        return df
+    except Exception as e:
+        logger.error(f"패턴 인식 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return df  # 오류 발생 시 원본 데이터프레임 반환
 
 @log_execution
 def calculate_rate_of_change(series: pd.Series, period: int) -> pd.Series:
@@ -353,6 +527,273 @@ def calculate_rate_of_change(series: pd.Series, period: int) -> pd.Series:
         logger.error(f"Error calculating ROC for period {period}: {e}")
         logger.debug(traceback.format_exc())
         return pd.Series(np.nan, index=series.index)
+
+
+@log_execution
+def calculate_awesome_oscillator(df: pd.DataFrame) -> pd.Series:
+    """
+    Calculate Awesome Oscillator
+    
+    Args:
+        df (pd.DataFrame): DataFrame with OHLCV data
+        
+    Returns:
+        pd.Series: Awesome Oscillator values
+    """
+    logger.debug(f"Awesome Oscillator 계산 시작. 입력 DF shape: {df.shape}")
+    required_cols = ['high', 'low']
+    if not all(col in df.columns for col in required_cols):
+        logger.error(f"Awesome Oscillator 계산에 필요한 컬럼({required_cols}) 없음. NaN 반환.")
+        return pd.Series(np.nan, index=df.index)
+        
+    if len(df) < 34: # Needs at least 34 periods for sma34
+        logger.warning(f"Awesome Oscillator 계산 위한 데이터 부족 ({len(df)} < 34). NaN 반환.")
+        return pd.Series(np.nan, index=df.index)
+
+    try:
+        # Ensure inputs are numeric, coercing errors to NaN
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+
+        if high.isnull().all() or low.isnull().all():
+             logger.warning("Awesome Oscillator 입력 high/low 전체가 NaN 또는 변환 불가. NaN 반환.")
+             return pd.Series(np.nan, index=df.index)
+
+        logger.debug(f"Awesome Oscillator 입력 데이터 타입: High={high.dtype}, Low={low.dtype}")
+        logger.debug(f"Awesome Oscillator 입력 데이터 head:\\n{df[['high', 'low']].head()}")
+
+        # Median price
+        median_price = (high + low) / 2
+        
+        # Calculate 5-period simple moving average (use min_periods=1)
+        sma5 = median_price.rolling(window=5, min_periods=1).mean()
+        
+        # Calculate 34-period simple moving average (use min_periods=1)
+        sma34 = median_price.rolling(window=34, min_periods=1).mean()
+        
+        # Awesome Oscillator
+        ao = sma5 - sma34
+
+        # Replace inf/-inf with NaN
+        ao.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        logger.debug("Awesome Oscillator 계산 완료")
+        return ao
+        
+    except Exception as e:
+        logger.error(f"Awesome Oscillator 계산 중 오류 발생: {e}")
+        # Log detailed info in except block
+        logger.error(f"Exception type: {type(e)}")
+        logger.error(f"Input data types causing error: High={df['high'].dtype}, Low={df['low'].dtype}")
+        logger.error(f"Input data head causing error:\\n{df[['high', 'low']].head()}")
+        logger.error(traceback.format_exc()) # Log the full traceback
+        # Return NaN series on failure
+        return pd.Series(np.nan, index=df.index)
+
+
+@log_execution
+def calculate_williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    윌리엄스 %R을 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLC 데이터가 포함된 데이터프레임
+        period (int): 계산 기간
+        
+    Returns:
+        pd.Series: 윌리엄스 %R 값 시리즈
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
+        
+        required_cols = ['high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"윌리엄스 %R 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # 데이터 변환
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        close = pd.to_numeric(df['close'], errors='coerce')
+        
+        # 기간 내 최고가, 최저가 계산
+        highest_high = high.rolling(window=period, min_periods=1).max()
+        lowest_low = low.rolling(window=period, min_periods=1).min()
+        
+        # 윌리엄스 %R 계산
+        williams_r = -100 * ((highest_high - close) / (highest_high - lowest_low))
+        
+        # 0으로 나누는 경우 처리
+        williams_r = williams_r.replace([np.inf, -np.inf], np.nan)
+        
+        # NaN 값 처리
+        williams_r = williams_r.fillna(method='ffill').fillna(method='bfill').fillna(-50)
+        
+        return williams_r
+    except Exception as e:
+        logger.error(f"윌리엄스 %R 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(-50, index=df.index)  # 오류 발생 시 -50 반환
+
+
+@log_execution
+def calculate_percent_b(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 20, window_dev: int = 2) -> pd.Series:
+    """Calculate Bollinger Bands %B"""
+    try:
+        # Ensure inputs are numeric
+        high = pd.to_numeric(high, errors='coerce')
+        low = pd.to_numeric(low, errors='coerce')
+        close = pd.to_numeric(close, errors='coerce')
+
+        if high.isnull().all() or low.isnull().all() or close.isnull().all():
+            logger.warning("%B 계산 입력 데이터에 문제가 있습니다.")
+            return pd.Series(np.nan, index=close.index)
+
+        bollinger = BollingerBands(close=close, window=window, window_dev=window_dev, fillna=True)
+        bb_high = bollinger.bollinger_hband()
+        bb_low = bollinger.bollinger_lband()
+        
+        # Avoid division by zero when bands are equal
+        band_diff = bb_high - bb_low
+        percent_b = (close - bb_low) / band_diff.replace(0, np.nan) # Replace 0 with NaN before division
+
+        percent_b.replace([np.inf, -np.inf], np.nan, inplace=True) # Handle division by zero/inf
+        # Fill NaNs (from division by zero or initial calculation)
+        return percent_b.fillna(method='ffill').fillna(method='bfill').fillna(0.5) # Fill remaining NaNs with 0.5 (mid-band)
+    except Exception as e:
+        logger.error(f"Error calculating %B: {e}")
+        logger.debug(traceback.format_exc())
+        return pd.Series(np.nan, index=close.index)
+
+
+@log_execution
+def calculate_cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, window: int = 20) -> pd.Series:
+    """Calculate Chaikin Money Flow (CMF)"""
+    try:
+        # Ensure inputs are numeric
+        high = pd.to_numeric(high, errors='coerce')
+        low = pd.to_numeric(low, errors='coerce')
+        close = pd.to_numeric(close, errors='coerce')
+        volume = pd.to_numeric(volume, errors='coerce')
+
+        if high.isnull().all() or low.isnull().all() or close.isnull().all() or volume.isnull().all():
+            logger.warning("CMF 계산 입력 데이터에 문제가 있습니다.")
+            return pd.Series(np.nan, index=close.index)
+
+        # Avoid division by zero if high equals low
+        hl_diff = (high - low).replace(0, np.nan) # Replace 0 difference with NaN
+
+        # Calculate Money Flow Multiplier safely
+        mfm = ((close - low) - (high - close)) / hl_diff
+        mfm = mfm.fillna(0) # Fill NaNs where high == low or calculation resulted in NaN
+
+        # Calculate Money Flow Volume
+        mfv = mfm * volume.fillna(0) # Use filled volume
+
+        # Calculate CMF denominator safely
+        vol_sum = volume.rolling(window=window, min_periods=1).sum().replace(0, np.nan)
+
+        cmf = mfv.rolling(window=window, min_periods=1).sum() / vol_sum
+        cmf.replace([np.inf, -np.inf], np.nan, inplace=True) # Handle potential division by zero
+        return cmf.fillna(method='ffill').fillna(method='bfill').fillna(0) # Fill NaNs with 0
+
+    except Exception as e:
+        logger.error(f"Error calculating CMF: {e}")
+        logger.debug(traceback.format_exc())
+        return pd.Series(np.nan, index=close.index)
+
+
+@log_execution
+def calculate_ema_dist_norm(close: pd.Series, window_fast: int = 12, window_slow: int = 26) -> pd.Series:
+    """Calculate normalized distance between fast and slow EMAs"""
+    try:
+        close_numeric = pd.to_numeric(close, errors='coerce')
+        if close_numeric.isnull().all():
+             logger.warning("EMA Distance Norm 계산 입력 데이터(close)에 문제가 있습니다.")
+             return pd.Series(np.nan, index=close.index)
+
+        ema_fast = EMAIndicator(close=close_numeric, window=window_fast, fillna=True).ema_indicator()
+        ema_slow = EMAIndicator(close=close_numeric, window=window_slow, fillna=True).ema_indicator()
+        ema_dist = ema_fast - ema_slow
+
+        # Normalize the distance using division by close price (handle zero close price)
+        close_safe = close_numeric.replace(0, np.nan)
+        ema_dist_norm = ema_dist / close_safe
+
+        ema_dist_norm.replace([np.inf, -np.inf], np.nan, inplace=True)
+        # Fill NaNs (from division by zero or initial calculation)
+        return ema_dist_norm.fillna(method='ffill').fillna(method='bfill').fillna(0) # Fill remaining NaNs with 0
+    except Exception as e:
+        logger.error(f"Error calculating EMA Distance Norm: {e}")
+        logger.debug(traceback.format_exc())
+        return pd.Series(np.nan, index=close.index)
+
+
+@log_execution
+def calculate_vwap(df: pd.DataFrame) -> pd.Series:
+    """
+    Calculate Volume Weighted Average Price (VWAP)
+    
+    Args:
+        df (pd.DataFrame): DataFrame with OHLCV data
+        
+    Returns:
+        pd.Series: VWAP values or NaN Series on error
+    """
+    nan_series = pd.Series(np.nan, index=df.index)
+    
+    logger.debug(f"VWAP 계산 시작. 입력 DF shape: {df.shape}")
+    required_cols = ['high', 'low', 'close', 'volume']
+    if not all(col in df.columns for col in required_cols):
+        logger.error(f"VWAP 계산에 필요한 컬럼({required_cols}) 없음. NaN Series 반환.")
+        return nan_series
+
+    try:
+        # Ensure inputs are numeric, coercing errors to NaN
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        close = pd.to_numeric(df['close'], errors='coerce')
+        volume = pd.to_numeric(df['volume'], errors='coerce')
+
+        # Check if coercion resulted in all NaNs for essential columns
+        if high.isnull().all() or low.isnull().all() or close.isnull().all() or volume.isnull().all():
+             logger.warning("VWAP 입력 high/low/close/volume 중 하나 이상이 전체 NaN 또는 변환 불가. NaN Series 반환.")
+             return nan_series
+             
+        logger.debug(f"VWAP 입력 데이터 타입: High={high.dtype}, Low={low.dtype}, Close={close.dtype}, Volume={volume.dtype}")
+        logger.debug(f"VWAP 입력 데이터 head:\\n{df[required_cols].head()}")
+
+        # Typical price
+        typical_price = (high + low + close) / 3
+        
+        # Volume * typical price (handle potential NaNs from conversion)
+        vol_tp = typical_price * volume.fillna(0) # Fill volume NaN with 0 for this calculation
+        
+        # Cumulative values
+        cumulative_vol_tp = vol_tp.cumsum()
+        cumulative_volume = volume.fillna(0).cumsum()
+        
+        # VWAP calculation - avoid division by zero
+        vwap = cumulative_vol_tp / cumulative_volume.replace(0, np.nan) # Replace 0 cumulative volume with NaN to avoid division by zero
+        
+        # Replace inf/-inf with NaN
+        vwap.replace([np.inf, -np.inf], np.nan, inplace=True)
+        
+        logger.debug("VWAP 계산 완료")
+        return vwap
+        
+    except Exception as e:
+        logger.error(f"VWAP 계산 중 오류 발생: {e}")
+        # Log detailed info in except block
+        logger.error(f"Exception type: {type(e)}")
+        logger.error(f"Input data types causing error: High={df['high'].dtype}, Low={df['low'].dtype}, Close={df['close'].dtype}, Volume={df['volume'].dtype}")
+        logger.error(f"Input data head causing error:\\n{df[required_cols].head()}")
+        logger.error(traceback.format_exc()) # Log the full traceback
+        # Return NaN series on failure
+        return nan_series
 
 
 @log_execution
@@ -507,1369 +948,833 @@ def calculate_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
 @log_execution
 def calculate_keltner_channel(df: pd.DataFrame, ema_period: int = 20, atr_period: int = 10, multiplier: float = 2.0) -> pd.DataFrame:
     """
-    Calculate Keltner Channel
+    켈트너 채널(Keltner Channel)을 계산합니다.
     
     Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        ema_period (int, optional): Period for EMA calculation. Defaults to 20.
-        atr_period (int, optional): Period for ATR calculation. Defaults to 10.
-        multiplier (float, optional): Multiplier for ATR. Defaults to 2.0.
+        df (pd.DataFrame): OHLC 데이터가 포함된 데이터프레임
+        ema_period (int): EMA 계산 기간
+        atr_period (int): ATR 계산 기간
+        multiplier (float): ATR 곱셈 계수
         
     Returns:
-        pd.DataFrame: DataFrame with Keltner Channel components or NaN DataFrame on error
+        pd.DataFrame: 켈트너 채널 컴포넌트가 포함된 데이터프레임
     """
-    # 결과 컬럼 이름 정의
-    keltner_cols = ['keltner_mband', 'keltner_hband', 'keltner_lband']
-    nan_df = pd.DataFrame(np.nan, index=df.index, columns=keltner_cols)
-    
-    logger.debug(f"Keltner 채널 계산 시작. 입력 DF shape: {df.shape}, EMA={ema_period}, ATR={atr_period}, Mult={multiplier}")
-    
-    # 필요한 컬럼 체크
-    required_cols = ['high', 'low', 'close']
-    if not all(col in df.columns for col in required_cols):
-        logger.error(f"Keltner 채널 계산에 필요한 컬럼({required_cols}) 없음. NaN DF 반환.")
-        return nan_df
-        
-    # 최소 필요 길이 확인
-    min_len = max(ema_period, atr_period)
-    if len(df) < min_len:
-        logger.warning(f"Keltner 채널 계산 위한 데이터 부족 ({len(df)} < {min_len}). NaN DF 반환.")
-        return nan_df
-
-    # 순서대로 시도할 두 가지 방법
-    methods = [
-        "direct_ta_library",   # ta 라이브러리의 KeltnerChannel 클래스 직접 사용
-        "manual_calculation"   # 직접 EMA와 ATR 계산
-    ]
-
-    for method in methods:
-        try:
-            logger.debug(f"Keltner 채널 계산 시도: {method}")
-            
-            # 입력 데이터 변환
-            high = pd.to_numeric(df['high'], errors='coerce')
-            low = pd.to_numeric(df['low'], errors='coerce')
-            close = pd.to_numeric(df['close'], errors='coerce')
-
-            # 데이터 유효성 검사
-            if high.isnull().all() or low.isnull().all() or close.isnull().all():
-                logger.warning("Keltner 입력 high/low/close 전체가 NaN 또는 변환 불가. 다음 방법 시도.")
-                continue
-                
-            # NaN 값 비율 확인
-            nan_ratio = (high.isnull().sum() + low.isnull().sum() + close.isnull().sum()) / (len(df) * 3)
-            if nan_ratio > 0.3:  # 30% 이상이 NaN이면 경고 로그
-                logger.warning(f"Keltner 입력 데이터에 높은 NaN 비율 ({nan_ratio:.2%})이 포함됨.")
-
-            # 결측치 사전 처리 (중요: 전방 채우기 후 후방 채우기)
-            high = high.fillna(method='ffill').fillna(method='bfill')
-            low = low.fillna(method='ffill').fillna(method='bfill')
-            close = close.fillna(method='ffill').fillna(method='bfill')
-
-            if method == "direct_ta_library":
-                # ta 라이브러리의 KeltnerChannel 클래스 직접 사용
-                keltner = KeltnerChannel(
-                    high=high, 
-                    low=low, 
-                    close=close, 
-                    window=ema_period, 
-                    window_atr=atr_period, 
-                    fillna=True,  # 결측치 자동 처리
-                    original_version=False,  # 표준 버전 사용
-                    multiplier=multiplier  # multiplier 파라미터 추가
-                )
-                
-                # 각 밴드 계산 - API 변경 문제 처리
-                try:
-                    # 새로운 API에서는 multiplier를 생성자에 전달
-                    mband = keltner.keltner_channel_mband()
-                    hband = keltner.keltner_channel_hband()
-                    lband = keltner.keltner_channel_lband()
-                except TypeError as te:
-                    # API 호환성 문제 - 기존 방식으로 시도
-                    logger.warning(f"Keltner 채널 API 호환성 문제: {str(te)}. 다른 방법 시도.")
-                    # 수동 계산 방법으로 대체
-                    method = "manual_calculation"
-                    continue
-                
-                # 값 유효성 검사: 모두 NaN이면 실패로 간주
-                if mband.isna().all() or hband.isna().all() or lband.isna().all():
-                    logger.warning("KeltnerChannel 클래스에서 반환된 밴드가 모두 NaN입니다. 다음 방법 시도.")
-                    continue
-                    
-                # 결과 구성
-                result_df = pd.DataFrame({
-                    'keltner_mband': mband,
-                    'keltner_hband': hband,
-                    'keltner_lband': lband
-                }, index=df.index)
-                
-            else:  # "manual_calculation"
-                # EMA 계산 
-                ema = EMAIndicator(close=close, window=ema_period, fillna=True)
-                middle = ema.ema_indicator()
-                
-                # ATR 계산
-                atr_ind = AverageTrueRange(high=high, low=low, close=close, window=atr_period, fillna=True)
-                atr = atr_ind.average_true_range()
-                
-                # 무한대 또는 NaN 값 확인 및 처리
-                if atr.isna().all() or np.isinf(atr).any():
-                    logger.warning("ATR 계산 결과에 문제가 있습니다. 중간 값으로 대체.")
-                    # 문제 해결: ATR을 단순 TR의 이동평균으로 계산
-                    tr = pd.DataFrame()
-                    tr['h-l'] = high - low
-                    tr['h-pc'] = abs(high - close.shift(1))
-                    tr['l-pc'] = abs(low - close.shift(1))
-                    tr['tr'] = tr[['h-l', 'h-pc', 'l-pc']].max(axis=1)
-                    atr = tr['tr'].rolling(window=atr_period, min_periods=1).mean()
-                
-                # 밴드 계산
-                upper = middle + (multiplier * atr)
-                lower = middle - (multiplier * atr)
-                
-                # 결과 구성
-                result_df = pd.DataFrame({
-                    'keltner_mband': middle,
-                    'keltner_hband': upper,
-                    'keltner_lband': lower
-                }, index=df.index)
-        
-            # 무한대 값을 NaN으로 대체
-            result_df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        
-            # NaN 상태 확인 및 보고
-            nan_stats = result_df.isna().sum()
-            if nan_stats.sum() > 0:
-                logger.warning(f"Keltner 채널 계산 후 NaN 상태: {nan_stats.to_dict()}")
-                
-                # NaN 비율이 너무 높으면 경고
-                nan_ratio = result_df.isna().mean().mean()
-                if nan_ratio > 0.3:  # 30% 이상이 NaN이면 경고
-                    logger.warning(f"계산된 Keltner 채널에 높은 NaN 비율({nan_ratio:.2%})이 있습니다. 결과의 신뢰성이 떨어질 수 있습니다.")
-                
-                # NaN 처리: 전방 채우기 후 후방 채우기, 그래도 남아있으면 0으로 대체
-                result_df = result_df.fillna(method='ffill').fillna(method='bfill').fillna(0)
-                logger.info("Keltner 채널의 NaN 값을 채움 처리했습니다.")
-            
-            logger.debug(f"Keltner 채널 계산 성공 (방법: {method})")
-            return result_df
-        
-        except Exception as e:
-            logger.error(f"Keltner 채널 계산 중 오류 발생 (방법: {method}): {e}")
-            logger.debug(f"Exception type: {type(e)}")
-            logger.debug(traceback.format_exc())
-            logger.info(f"다른 방법으로 Keltner 채널 계산을 시도합니다.")
-            continue
-    
-    # 모든 방법이 실패한 경우
-    logger.error("모든 Keltner 채널 계산 방법이 실패했습니다. NaN DataFrame을 반환합니다.")
-    return nan_df
-
-
-@log_execution
-def calculate_awesome_oscillator(df: pd.DataFrame) -> pd.Series:
-    """
-    Calculate Awesome Oscillator
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        
-    Returns:
-        pd.Series: Awesome Oscillator values
-    """
-    logger.debug(f"Awesome Oscillator 계산 시작. 입력 DF shape: {df.shape}")
-    required_cols = ['high', 'low']
-    if not all(col in df.columns for col in required_cols):
-        logger.error(f"Awesome Oscillator 계산에 필요한 컬럼({required_cols}) 없음. NaN 반환.")
-        return pd.Series(np.nan, index=df.index)
-        
-    if len(df) < 34: # Needs at least 34 periods for sma34
-        logger.warning(f"Awesome Oscillator 계산 위한 데이터 부족 ({len(df)} < 34). NaN 반환.")
-        return pd.Series(np.nan, index=df.index)
-
     try:
-        # Ensure inputs are numeric, coercing errors to NaN
-        high = pd.to_numeric(df['high'], errors='coerce')
-        low = pd.to_numeric(df['low'], errors='coerce')
-
-        if high.isnull().all() or low.isnull().all():
-             logger.warning("Awesome Oscillator 입력 high/low 전체가 NaN 또는 변환 불가. NaN 반환.")
-             return pd.Series(np.nan, index=df.index)
-
-        logger.debug(f"Awesome Oscillator 입력 데이터 타입: High={high.dtype}, Low={low.dtype}")
-        logger.debug(f"Awesome Oscillator 입력 데이터 head:\\n{df[['high', 'low']].head()}")
-
-        # Median price
-        median_price = (high + low) / 2
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.DataFrame()
         
-        # Calculate 5-period simple moving average (use min_periods=1)
-        sma5 = median_price.rolling(window=5, min_periods=1).mean()
+        required_cols = ['high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"켈트너 채널 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.DataFrame()
         
-        # Calculate 34-period simple moving average (use min_periods=1)
-        sma34 = median_price.rolling(window=34, min_periods=1).mean()
-        
-        # Awesome Oscillator
-        ao = sma5 - sma34
-
-        # Replace inf/-inf with NaN
-        ao.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        logger.debug("Awesome Oscillator 계산 완료")
-        return ao
-        
-    except Exception as e:
-        logger.error(f"Awesome Oscillator 계산 중 오류 발생: {e}")
-        # Log detailed info in except block
-        logger.error(f"Exception type: {type(e)}")
-        logger.error(f"Input data types causing error: High={df['high'].dtype}, Low={df['low'].dtype}")
-        logger.error(f"Input data head causing error:\\n{df[['high', 'low']].head()}")
-        logger.error(traceback.format_exc()) # Log the full traceback
-        # Return NaN series on failure
-        return pd.Series(np.nan, index=df.index)
-
-
-@log_execution
-def calculate_williams_r(df, period=14):
-    """Williams %R 계산"""
-    logger.debug(f"데이터프레임 길이: {len(df)}, 필요 기간: {period}")
-    if len(df) < period:
-        logger.warning(f"Williams %R 계산 위한 데이터 부족 ({len(df)} < {period}). NaN 반환.")
-        return pd.Series(np.nan, index=df.index)
-
-    try:
-        # 입력 데이터 타입 확인 (추가)
-        logger.debug(f"Williams %R 입력 데이터 타입:\nHigh: {df['high'].dtype}, Low: {df['low'].dtype}, Close: {df['close'].dtype}")
-        logger.debug(f"Williams %R 입력 데이터 head:\n{df[['high', 'low', 'close']].head()}")
-
-        # Ensure inputs are numeric, coercing errors to NaN
+        # 데이터 변환
         high = pd.to_numeric(df['high'], errors='coerce')
         low = pd.to_numeric(df['low'], errors='coerce')
         close = pd.to_numeric(df['close'], errors='coerce')
-
-        highest_high = high.rolling(window=period, min_periods=1).max()
-        lowest_low = low.rolling(window=period, min_periods=1).min()
-
-        williams_r = (highest_high - close) / (highest_high - lowest_low) * -100
-
-        # Replace inf/-inf with NaN resulting from division by zero
-        williams_r.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-        logger.debug("Williams %R 계산 완료")
-        return williams_r
+        
+        # 켈트너 채널 계산
+        # 1. EMA 계산
+        ema = close.ewm(span=ema_period, adjust=False).mean()
+        
+        # 2. ATR 계산
+        atr = calculate_atr(df, period=atr_period)
+        
+        # 3. 채널 계산
+        upper_band = ema + (multiplier * atr)
+        lower_band = ema - (multiplier * atr)
+        
+        # 결과 데이터프레임 생성
+        keltner_df = pd.DataFrame({
+            'keltner_mband': ema,
+            'keltner_hband': upper_band,
+            'keltner_lband': lower_band
+        }, index=df.index)
+        
+        # NaN 값 처리
+        keltner_df = keltner_df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        return keltner_df
     except Exception as e:
-        logger.error(f"Williams %R 계산 중 오류 발생: {e}")
-        # Log detailed info in except block
-        logger.error(f"Exception type: {type(e)}")
-        logger.error(f"Input data types causing error:\nHigh: {df['high'].dtype}, Low: {df['low'].dtype}, Close: {df['close'].dtype}")
-        logger.error(f"Input data head causing error:\n{df[['high', 'low', 'close']].head()}")
-        logger.error(traceback.format_exc()) # Log the full traceback
-        # Return NaN series on failure
-        return pd.Series(np.nan, index=df.index)
-
+        logger.error(f"켈트너 채널 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.DataFrame()  # 오류 발생 시 빈 DataFrame 반환
 
 @log_execution
-def calculate_vwap(df: pd.DataFrame) -> pd.Series:
+def calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate Volume Weighted Average Price (VWAP)
+    모든 기술적 지표를 계산하여 데이터프레임에 추가합니다.
     
     Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
+        df (pd.DataFrame): OHLCV 데이터가 포함된 데이터프레임
         
     Returns:
-        pd.Series: VWAP values or NaN Series on error
+        pd.DataFrame: 모든 지표가 추가된 데이터프레임
     """
-    nan_series = pd.Series(np.nan, index=df.index)
-    
-    logger.debug(f"VWAP 계산 시작. 입력 DF shape: {df.shape}")
-    required_cols = ['high', 'low', 'close', 'volume']
-    if not all(col in df.columns for col in required_cols):
-        logger.error(f"VWAP 계산에 필요한 컬럼({required_cols}) 없음. NaN Series 반환.")
-        return nan_series
+    if df is None or len(df) < 14:  # 대부분의 지표에 14일 이상의 데이터 필요
+        logger.warning("지표 계산을 위한 충분한 데이터가 없습니다.")
+        return df
 
     try:
-        # Ensure inputs are numeric, coercing errors to NaN
+        # 기본 OHLCV 컬럼 확인
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            logger.error(f"필수 OHLCV 컬럼이 누락되었습니다: {missing_columns}")
+            return df
+            
+        # 계산 시작
+        logger.info("기술적 지표 계산 시작...")
+        
+        # 1. 기본 지표 추가
+        df = add_basic_indicators(df)
+        
+        # 2. 고급 지표 추가
+        df = add_advanced_indicators(df)
+        
+        # 3. 사용자 정의 지표 추가
+        try:
+            # 새로 생성한 모듈에서 함수 임포트
+            from data.indicators import add_custom_indicators
+            df = add_custom_indicators(df)
+        except ImportError:
+            logger.warning("custom_indicators 모듈을 임포트할 수 없습니다. 사용자 정의 지표 계산을 건너뜁니다.")
+            
+        # 4. 패턴 인식 지표 추가
+        try:
+            # 새로 생성한 모듈에서 함수 임포트
+            from data.indicators import add_pattern_recognition
+            df = add_pattern_recognition(df)
+        except ImportError:
+            logger.warning("custom_indicators 모듈을 임포트할 수 없습니다. 패턴 인식 지표 계산을 건너뜁니다.")
+        
+        # 5. NaN 값 처리
+        df = df.replace([np.inf, -np.inf], np.nan)
+        
+        # 앞쪽의 NaN 값 제거 (충분한 기간의 데이터가 있을 경우)
+        if len(df) > 200:  # 200일 이상의 데이터가 있는 경우
+            df = df.iloc[200:].copy()  # 앞쪽 200일 제거
+        
+        # 남은 NaN 값은 forward fill로 채우기
+        df = df.fillna(method='ffill')
+        
+        # 그래도 남은 NaN 값은 backward fill로 채우기
+        df = df.fillna(method='bfill')
+        
+        # 최종적으로 남은 NaN 값은 0으로 대체
+        df = df.fillna(0)
+        
+        logger.info(f"모든 기술적 지표 계산 완료. 총 컬럼 수: {len(df.columns)}")
+        return df
+        
+    except Exception as e:
+        logger.error(f"지표 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return df  # 오류 발생 시 원본 데이터프레임 반환
+
+@log_execution
+def filter_indicators(df: pd.DataFrame, indicator_list: List[str] = None) -> pd.DataFrame:
+    """
+    필터링된 지표들만 포함하는 데이터프레임을 반환합니다.
+    
+    Args:
+        df (pd.DataFrame): 모든 지표가 포함된 데이터프레임
+        indicator_list (List[str], optional): 유지할 지표 리스트. None이면 기본 지표 사용.
+        
+    Returns:
+        pd.DataFrame: 필터링된 지표들만 포함하는 데이터프레임
+    """
+    try:
+        if indicator_list is None:
+            # 기본 주요 지표 목록
+            indicator_list = [
+                'open', 'high', 'low', 'close', 'volume',  # 기본 OHLCV
+                'sma7', 'sma25', 'ema12', 'ema26', 'ema200',  # 이동평균
+                'macd', 'macd_signal', 'macd_diff',  # MACD
+                'rsi14',  # RSI
+                'bb_upper', 'bb_middle', 'bb_lower',  # 볼린저 밴드
+                'stoch_k', 'stoch_d',  # 스토캐스틱
+                'atr', 'obv',  # 기타 인기 지표
+                'daily_return'  # 수익률
+            ]
+        
+        # 실제 데이터프레임에 존재하는 컬럼만 필터링
+        available_columns = [col for col in indicator_list if col in df.columns]
+        
+        if len(available_columns) < len(indicator_list):
+            missing_columns = set(indicator_list) - set(available_columns)
+            logger.warning(f"일부 요청된 지표가 데이터프레임에 없습니다: {missing_columns}")
+        
+        # 필터링된 데이터프레임 반환
+        return df[available_columns].copy()
+    
+    except Exception as e:
+        logger.error(f"지표 필터링 중 오류 발생: {str(e)}")
+        # 기본 OHLCV 컬럼만 반환 (최소한의 안전망)
+        basic_cols = ['open', 'high', 'low', 'close', 'volume']
+        available_basic = [col for col in basic_cols if col in df.columns]
+        return df[available_basic].copy()
+
+@log_execution
+def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+    """
+    상대강도지수(RSI)를 계산합니다.
+    
+    Args:
+        prices (pd.Series): 가격 시리즈
+        period (int): RSI 계산 기간
+        
+    Returns:
+        pd.Series: RSI 값 시리즈
+    """
+    try:
+        # RSI가 이미 계산되어 있는지 확인
+        if isinstance(prices, pd.DataFrame) and 'rsi' in prices.columns:
+            logger.debug("이미 계산된 RSI 값 반환")
+            return prices['rsi']
+        
+        # 입력이 DataFrame인 경우 'close' 컬럼 사용
+        if isinstance(prices, pd.DataFrame):
+            if 'close' in prices.columns:
+                prices = prices['close']
+            else:
+                logger.error("DataFrame에 'close' 컬럼이 없습니다.")
+                return pd.Series(np.nan, index=prices.index)
+        
+        # 입력이 Series인지 확인
+        if not isinstance(prices, pd.Series):
+            logger.error(f"올바르지 않은 입력 유형: {type(prices)}")
+            return pd.Series(np.nan, index=range(len(prices) if hasattr(prices, '__len__') else 0))
+        
+        # 숫자형으로 변환
+        prices = pd.to_numeric(prices, errors='coerce')
+        
+        # 충분한 데이터가 있는지 확인
+        if len(prices) < period + 1:
+            logger.warning(f"RSI 계산을 위한 데이터가 부족합니다. 필요: {period + 1}, 실제: {len(prices)}")
+            return pd.Series(50.0, index=prices.index)  # 기본값 50.0 반환
+        
+        # 가격 변화 계산
+        delta = prices.diff()
+        
+        # 상승/하락 구분
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        
+        # 첫번째 평균 계산
+        avg_gain = gain.rolling(window=period, min_periods=1).mean().iloc[period-1]
+        avg_loss = loss.rolling(window=period, min_periods=1).mean().iloc[period-1]
+        
+        # RSI 시리즈 초기화
+        rsi = pd.Series(np.nan, index=prices.index)
+        
+        # 첫 번째 RSI 값 계산
+        if avg_loss != 0:
+            rs = avg_gain / avg_loss
+            rsi.iloc[period] = 100 - (100 / (1 + rs))
+        else:
+            rsi.iloc[period] = 100
+        
+        # 나머지 RSI 값 계산
+        for i in range(period + 1, len(prices)):
+            avg_gain = ((avg_gain * (period - 1)) + gain.iloc[i]) / period
+            avg_loss = ((avg_loss * (period - 1)) + loss.iloc[i]) / period
+            
+            if avg_loss != 0:
+                rs = avg_gain / avg_loss
+                rsi.iloc[i] = 100 - (100 / (1 + rs))
+            else:
+                rsi.iloc[i] = 100
+        
+        # 결측값 처리
+        rsi = rsi.fillna(50)  # NaN 값을 50으로 대체 (중립적인 RSI 값)
+        
+        return rsi
+    except Exception as e:
+        logger.error(f"RSI 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(50.0, index=prices.index)  # 오류 발생 시 50.0 반환
+
+@log_execution
+def calculate_stochastic(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    스토캐스틱 오실레이터의 %K 라인을 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLC 데이터가 포함된 데이터프레임
+        period (int): 계산 기간
+        
+    Returns:
+        pd.Series: 스토캐스틱 %K 값 시리즈
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
+        
+        required_cols = ['high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"스토캐스틱 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # 데이터 변환
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        close = pd.to_numeric(df['close'], errors='coerce')
+        
+        # 이동 최고값/최저값 계산
+        highest_high = high.rolling(window=period, min_periods=1).max()
+        lowest_low = low.rolling(window=period, min_periods=1).min()
+        
+        # %K 계산
+        k = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+        
+        # 0으로 나누는 경우 처리
+        k = k.replace([np.inf, -np.inf], np.nan)
+        
+        # NaN 값 처리
+        k = k.fillna(50)  # NaN 값을 50으로 대체 (중립적인 값)
+        
+        return k
+    except Exception as e:
+        logger.error(f"스토캐스틱 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(50, index=df.index)  # 오류 발생 시 50 반환
+
+@log_execution
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    평균 실제 범위(ATR)를 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLC 데이터가 포함된 데이터프레임
+        period (int): 계산 기간
+        
+    Returns:
+        pd.Series: ATR 값 시리즈
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
+        
+        required_cols = ['high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"ATR 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # 데이터 변환
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        close = pd.to_numeric(df['close'], errors='coerce')
+        close_prev = close.shift(1)
+        
+        # 실제 범위(TR) 계산
+        tr1 = high - low  # 당일 고가 - 당일 저가
+        tr2 = np.abs(high - close_prev)  # 당일 고가 - 전일 종가
+        tr3 = np.abs(low - close_prev)  # 당일 저가 - 전일 종가
+        
+        tr = pd.DataFrame({
+            'tr1': tr1,
+            'tr2': tr2,
+            'tr3': tr3
+        }).max(axis=1)
+        
+        # ATR 계산 (Wilder의 평활화 방법)
+        atr = np.nan * np.ones(len(df))
+        atr[period-1] = tr.iloc[:period].mean()  # 첫 번째 ATR 값
+        
+        for i in range(period, len(df)):
+            atr[i] = ((atr[i-1] * (period - 1)) + tr.iloc[i]) / period
+            
+        atr_series = pd.Series(atr, index=df.index)
+        
+        # NaN 값 처리
+        atr_series = atr_series.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        return atr_series
+    except Exception as e:
+        logger.error(f"ATR 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(0, index=df.index)  # 오류 발생 시 0 반환
+
+@log_execution
+def calculate_obv(df: pd.DataFrame) -> pd.Series:
+    """
+    온발런스 볼륨(OBV)을 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLCV 데이터가 포함된 데이터프레임
+        
+    Returns:
+        pd.Series: OBV 값 시리즈
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
+        
+        required_cols = ['close', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"OBV 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # 데이터 변환
+        close = pd.to_numeric(df['close'], errors='coerce')
+        volume = pd.to_numeric(df['volume'], errors='coerce')
+        
+        # 가격 변화 방향 계산
+        price_change = close.diff()
+        
+        # OBV 초기화
+        obv = pd.Series(0, index=df.index)
+        
+        # 첫 번째 값은 0으로 설정
+        obv.iloc[0] = 0
+        
+        # OBV 계산
+        for i in range(1, len(df)):
+            if np.isnan(price_change.iloc[i]):
+                obv.iloc[i] = obv.iloc[i-1]
+            elif price_change.iloc[i] > 0:  # 가격 상승
+                obv.iloc[i] = obv.iloc[i-1] + volume.iloc[i]
+            elif price_change.iloc[i] < 0:  # 가격 하락
+                obv.iloc[i] = obv.iloc[i-1] - volume.iloc[i]
+            else:  # 가격 동일
+                obv.iloc[i] = obv.iloc[i-1]
+        
+        return obv
+    except Exception as e:
+        logger.error(f"OBV 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(0, index=df.index)  # 오류 발생 시 0 반환
+
+@log_execution
+def calculate_parabolic_sar(df: pd.DataFrame, af_start: float = 0.02, af_max: float = 0.2) -> pd.Series:
+    """
+    파라볼릭 SAR(Stop And Reverse)을 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLC 데이터가 포함된 데이터프레임
+        af_start (float): 가속 팩터 시작값
+        af_max (float): 가속 팩터 최대값
+        
+    Returns:
+        pd.Series: 파라볼릭 SAR 값 시리즈
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
+        
+        required_cols = ['high', 'low']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"파라볼릭 SAR 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # 데이터 변환
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        
+        # 최소 2개의 데이터 포인트 필요
+        if len(df) < 2:
+            logger.warning("파라볼릭 SAR 계산을 위한 데이터가 부족합니다.")
+            return pd.Series(np.nan, index=df.index)
+        
+        # SAR 초기화
+        sar = np.zeros(len(df))
+        trend = np.zeros(len(df))  # 1: 상승 추세, -1: 하락 추세
+        extreme_point = np.zeros(len(df))
+        af = np.zeros(len(df))
+        
+        # 초기 추세 설정 (처음 2개 바 기준)
+        if high.iloc[1] > high.iloc[0]:
+            trend[1] = 1  # 상승 추세
+            sar[1] = low.iloc[0]  # SAR은 전일 저가
+            extreme_point[1] = high.iloc[1]  # EP는 현재 고가
+        else:
+            trend[1] = -1  # 하락 추세
+            sar[1] = high.iloc[0]  # SAR은 전일 고가
+            extreme_point[1] = low.iloc[1]  # EP는 현재 저가
+            
+        af[1] = af_start  # 초기 가속 팩터
+        
+        # 나머지 SAR 계산
+        for i in range(2, len(df)):
+            # 이전 추세 계속
+            if trend[i-1] == 1:  # 상승 추세
+                # SAR 계산
+                sar[i] = sar[i-1] + af[i-1] * (extreme_point[i-1] - sar[i-1])
+                
+                # SAR 제한 (전일, 전전일 저가보다 높으면 안 됨)
+                sar[i] = min(sar[i], low.iloc[i-2], low.iloc[i-1])
+                
+                # 추세 반전 확인
+                if low.iloc[i] < sar[i]:  # 현재 저가가 SAR 아래로 내려가면 추세 반전
+                    trend[i] = -1  # 하락 추세로 전환
+                    sar[i] = extreme_point[i-1]  # SAR은 이전 EP로 설정
+                    extreme_point[i] = low.iloc[i]  # EP는 현재 저가
+                    af[i] = af_start  # 가속 팩터 초기화
+                else:
+                    trend[i] = 1  # 상승 추세 유지
+                    # 새로운 최고가 갱신 확인
+                    if high.iloc[i] > extreme_point[i-1]:
+                        extreme_point[i] = high.iloc[i]  # EP 갱신
+                        af[i] = min(af[i-1] + af_start, af_max)  # AF 증가
+                    else:
+                        extreme_point[i] = extreme_point[i-1]  # EP 유지
+                        af[i] = af[i-1]  # AF 유지
+            else:  # 하락 추세
+                # SAR 계산
+                sar[i] = sar[i-1] + af[i-1] * (extreme_point[i-1] - sar[i-1])
+                
+                # SAR 제한 (전일, 전전일 고가보다 낮으면 안 됨)
+                sar[i] = max(sar[i], high.iloc[i-2], high.iloc[i-1])
+                
+                # 추세 반전 확인
+                if high.iloc[i] > sar[i]:  # 현재 고가가 SAR 위로 올라가면 추세 반전
+                    trend[i] = 1  # 상승 추세로 전환
+                    sar[i] = extreme_point[i-1]  # SAR은 이전 EP로 설정
+                    extreme_point[i] = high.iloc[i]  # EP는 현재 고가
+                    af[i] = af_start  # 가속 팩터 초기화
+                else:
+                    trend[i] = -1  # 하락 추세 유지
+                    # 새로운 최저가 갱신 확인
+                    if low.iloc[i] < extreme_point[i-1]:
+                        extreme_point[i] = low.iloc[i]  # EP 갱신
+                        af[i] = min(af[i-1] + af_start, af_max)  # AF 증가
+                    else:
+                        extreme_point[i] = extreme_point[i-1]  # EP 유지
+                        af[i] = af[i-1]  # AF 유지
+        
+        # SAR 시리즈 반환
+        sar_series = pd.Series(sar, index=df.index)
+        
+        # 초기 값 NaN으로 설정 (계산을 위한 충분한 데이터가 없어서)
+        sar_series.iloc[0] = np.nan
+        
+        # NaN 값 처리
+        sar_series = sar_series.fillna(method='bfill').fillna(method='ffill').fillna(0)
+        
+        return sar_series
+    except Exception as e:
+        logger.error(f"파라볼릭 SAR 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(0, index=df.index)  # 오류 발생 시 0 반환
+
+@log_execution
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    평균 방향성 지수(ADX)를 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLC 데이터가 포함된 데이터프레임
+        period (int): 계산 기간
+        
+    Returns:
+        pd.Series: ADX 값 시리즈
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
+        
+        required_cols = ['high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"ADX 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # 데이터 변환
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        close = pd.to_numeric(df['close'], errors='coerce')
+        
+        # 최소한 계산 기간 + 1일 데이터 필요
+        if len(df) <= period + 1:
+            logger.warning(f"ADX 계산을 위한 데이터가 부족합니다. 필요: {period + 1}, 실제: {len(df)}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # True Range 계산
+        high_low = high - low
+        high_close_prev = np.abs(high - close.shift(1))
+        low_close_prev = np.abs(low - close.shift(1))
+        
+        tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+        
+        # Directional Movement 계산
+        up_move = high - high.shift(1)
+        down_move = low.shift(1) - low
+        
+        # Positive Directional Movement (+DM)
+        pdm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        
+        # Negative Directional Movement (-DM)
+        ndm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        
+        # Smooth TR, +DM, -DM (Wilder's smoothing)
+        tr_period = pd.Series(tr).rolling(window=period).sum()
+        pdm_period = pd.Series(pdm).rolling(window=period).sum()
+        ndm_period = pd.Series(ndm).rolling(window=period).sum()
+        
+        # Smooth TR, +DM, -DM for remaining periods
+        for i in range(period + 1, len(df)):
+            tr_period.iloc[i] = tr_period.iloc[i-1] - (tr_period.iloc[i-1] / period) + tr.iloc[i]
+            pdm_period.iloc[i] = pdm_period.iloc[i-1] - (pdm_period.iloc[i-1] / period) + pdm[i]
+            ndm_period.iloc[i] = ndm_period.iloc[i-1] - (ndm_period.iloc[i-1] / period) + ndm[i]
+        
+        # +DI, -DI 계산
+        pdi = 100 * pdm_period / tr_period
+        ndi = 100 * ndm_period / tr_period
+        
+        # Directional Index (DX)
+        dx = 100 * np.abs(pdi - ndi) / (pdi + ndi)
+        
+        # Average Directional Index (ADX)
+        adx = pd.Series(np.nan, index=df.index)
+        
+        # 첫 번째 ADX 값 (초기 기간의 DX 평균)
+        adx.iloc[2 * period - 1] = dx.iloc[period:2 * period].mean()
+        
+        # 나머지 ADX 값 (Wilder의 평활화)
+        for i in range(2 * period, len(df)):
+            adx.iloc[i] = (adx.iloc[i-1] * (period - 1) + dx.iloc[i]) / period
+        
+        # NaN 값 처리
+        adx = adx.fillna(method='bfill').fillna(0)
+        
+        return adx
+    except Exception as e:
+        logger.error(f"ADX 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(0, index=df.index)  # 오류 발생 시 0 반환
+
+@log_execution
+def calculate_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    일목균형표(Ichimoku Cloud) 지표를 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLC 데이터가 포함된 데이터프레임
+        
+    Returns:
+        pd.DataFrame: 일목균형표 컴포넌트가 포함된 데이터프레임
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.DataFrame()
+        
+        required_cols = ['high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"일목균형표 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.DataFrame()
+        
+        # 데이터 변환
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        close = pd.to_numeric(df['close'], errors='coerce')
+        
+        # 일목균형표 계산
+        # 전환선(Tenkan-sen): 9일 고가와 저가의 중간값
+        tenkan_sen = (high.rolling(window=9).max() + low.rolling(window=9).min()) / 2
+        
+        # 기준선(Kijun-sen): 26일 고가와 저가의 중간값
+        kijun_sen = (high.rolling(window=26).max() + low.rolling(window=26).min()) / 2
+        
+        # 선행스팬A(Senkou Span A): (전환선 + 기준선) / 2, 26일 선행
+        senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
+        
+        # 선행스팬B(Senkou Span B): 52일 고가와 저가의 중간값, 26일 선행
+        senkou_span_b = ((high.rolling(window=52).max() + low.rolling(window=52).min()) / 2).shift(26)
+        
+        # 후행스팬(Chikou Span): 종가를 26일 후행
+        chikou_span = close.shift(-26)
+        
+        # 결과 데이터프레임 생성
+        ichimoku_df = pd.DataFrame({
+            'ichimoku_tenkan_sen': tenkan_sen,
+            'ichimoku_kijun_sen': kijun_sen,
+            'ichimoku_senkou_span_a': senkou_span_a,
+            'ichimoku_senkou_span_b': senkou_span_b,
+            'ichimoku_chikou_span': chikou_span
+        }, index=df.index)
+        
+        # NaN 값 처리
+        ichimoku_df = ichimoku_df.fillna(method='ffill').fillna(method='bfill').fillna(0)
+        
+        return ichimoku_df
+    except Exception as e:
+        logger.error(f"일목균형표 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.DataFrame()  # 오류 발생 시 빈 DataFrame 반환
+
+@log_execution
+def calculate_cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
+    """
+    상품채널지수(CCI)를 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLC 데이터가 포함된 데이터프레임
+        period (int): 계산 기간
+        
+    Returns:
+        pd.Series: CCI 값 시리즈
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
+        
+        required_cols = ['high', 'low', 'close']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"CCI 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # 데이터 변환
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        close = pd.to_numeric(df['close'], errors='coerce')
+        
+        # 일반적인 가격(TP) 계산
+        tp = (high + low + close) / 3
+        
+        # 이동 평균(SMA) 계산
+        tp_sma = tp.rolling(window=period, min_periods=1).mean()
+        
+        # 평균 편차(MD) 계산
+        md = tp.rolling(window=period, min_periods=1).apply(lambda x: np.mean(np.abs(x - np.mean(x))))
+        
+        # CCI 계산
+        cci = (tp - tp_sma) / (0.015 * md)
+        
+        # NaN 값 처리
+        cci = cci.fillna(0)
+        
+        return cci
+    except Exception as e:
+        logger.error(f"CCI 계산 중 오류 발생: {str(e)}")
+        logger.error(traceback.format_exc())
+        return pd.Series(0, index=df.index)  # 오류 발생 시 0 반환
+
+@log_execution
+def calculate_mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    자금흐름지수(MFI)를 계산합니다.
+    
+    Args:
+        df (pd.DataFrame): OHLCV 데이터가 포함된 데이터프레임
+        period (int): 계산 기간
+        
+    Returns:
+        pd.Series: MFI 값 시리즈
+    """
+    try:
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
+        
+        required_cols = ['high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"MFI 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
+        
+        # 데이터 변환
         high = pd.to_numeric(df['high'], errors='coerce')
         low = pd.to_numeric(df['low'], errors='coerce')
         close = pd.to_numeric(df['close'], errors='coerce')
         volume = pd.to_numeric(df['volume'], errors='coerce')
-
-        # Check if coercion resulted in all NaNs for essential columns
-        if high.isnull().all() or low.isnull().all() or close.isnull().all() or volume.isnull().all():
-             logger.warning("VWAP 입력 high/low/close/volume 중 하나 이상이 전체 NaN 또는 변환 불가. NaN Series 반환.")
-             return nan_series
-             
-        logger.debug(f"VWAP 입력 데이터 타입: High={high.dtype}, Low={low.dtype}, Close={close.dtype}, Volume={volume.dtype}")
-        logger.debug(f"VWAP 입력 데이터 head:\\n{df[required_cols].head()}")
-
-        # Typical price
-        typical_price = (high + low + close) / 3
         
-        # Volume * typical price (handle potential NaNs from conversion)
-        vol_tp = typical_price * volume.fillna(0) # Fill volume NaN with 0 for this calculation
+        # 일반적인 가격(TP) 계산
+        tp = (high + low + close) / 3
         
-        # Cumulative values
-        cumulative_vol_tp = vol_tp.cumsum()
-        cumulative_volume = volume.fillna(0).cumsum()
+        # 자금 흐름(MF) 계산
+        mf = tp * volume
         
-        # VWAP calculation - avoid division by zero
-        vwap = cumulative_vol_tp / cumulative_volume.replace(0, np.nan) # Replace 0 cumulative volume with NaN to avoid division by zero
+        # 양수 자금 흐름(PMF)과 음수 자금 흐름(NMF) 계산
+        pmf = pd.Series(np.where(tp > tp.shift(1), mf, 0), index=df.index)
+        nmf = pd.Series(np.where(tp < tp.shift(1), mf, 0), index=df.index)
         
-        # Replace inf/-inf with NaN
-        vwap.replace([np.inf, -np.inf], np.nan, inplace=True)
+        # PMF와 NMF의 이동 합계 계산
+        pmf_sum = pmf.rolling(window=period, min_periods=1).sum()
+        nmf_sum = nmf.rolling(window=period, min_periods=1).sum()
         
-        logger.debug("VWAP 계산 완료")
-        return vwap
+        # 자금 비율(MR) 계산 (0으로 나누는 것 방지)
+        mr = np.where(nmf_sum != 0, pmf_sum / nmf_sum, 1)
         
+        # MFI 계산
+        mfi = 100 - (100 / (1 + mr))
+        
+        # NaN 값 처리
+        mfi_series = pd.Series(mfi, index=df.index)
+        mfi_series = mfi_series.fillna(method='ffill').fillna(method='bfill').fillna(50)
+        
+        return mfi_series
     except Exception as e:
-        logger.error(f"VWAP 계산 중 오류 발생: {e}")
-        # Log detailed info in except block
-        logger.error(f"Exception type: {type(e)}")
-        logger.error(f"Input data types causing error: High={df['high'].dtype}, Low={df['low'].dtype}, Close={df['close'].dtype}, Volume={df['volume'].dtype}")
-        logger.error(f"Input data head causing error:\\n{df[required_cols].head()}")
-        logger.error(traceback.format_exc()) # Log the full traceback
-        # Return NaN series on failure
-        return nan_series
-
-
-@log_execution
-def add_custom_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add custom technical indicators
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        
-    Returns:
-        pd.DataFrame: DataFrame with added indicators
-    """
-    if df is None or df.empty:
-        logger.warning("add_custom_indicators: 입력 DataFrame이 비어 있습니다.")
-        return df
-        
-    # Make a copy to avoid modifying the original
-    result = df.copy()
-    
-    try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close', 'volume']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"add_custom_indicators: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return df
-                
-        # 데이터 길이 확인
-        if len(result) < 200:  # EMA200이 필요할 수 있으므로 최소 길이 확인
-            logger.warning(f"add_custom_indicators: 데이터 길이가 너무 짧습니다 ({len(result)} < 200)")
-            # 계속 진행하지만 경고 로그 남김
-            
-        # 컬럼 데이터를 숫자형으로 변환
-        for col in required_columns:
-            if not pd.api.types.is_numeric_dtype(result[col]):
-                logger.info(f"add_custom_indicators: '{col}' 컬럼을 숫자형으로 변환합니다.")
-                result[col] = pd.to_numeric(result[col], errors='coerce')
-        
-        # Volume-based indicators
-        result['volume_sma7'] = SMAIndicator(close=result['volume'], window=7).sma_indicator()
-        result['volume_ema20'] = EMAIndicator(close=result['volume'], window=20).ema_indicator()
-        
-        # Volume / Moving Average ratio (Volume Surge indicator)
-        result['volume_surge'] = result['volume'] / result['volume_sma7']
-        
-        # Price momentum indicators
-        result['momentum_3d'] = result['close'] / result['close'].shift(3) - 1
-        result['momentum_7d'] = result['close'] / result['close'].shift(7) - 1
-        result['momentum_14d'] = result['close'] / result['close'].shift(14) - 1
-        
-        # Volatility ratio (comparing recent volatility to historical)
-        result['volatility_ratio'] = result['close'].pct_change().rolling(5).std() / result['close'].pct_change().rolling(20).std()
-        
-        # Distance from moving averages (normalized)
-        # ema200 컬럼이 존재하는지 확인하고 없으면 계산
-        if 'ema200' not in result.columns:
-            logger.info("add_custom_indicators: 'ema200' 컬럼이 없어 직접 계산합니다.")
-            try:
-                result['ema200'] = EMAIndicator(close=result['close'], window=200).ema_indicator()
-            except Exception as ema_err:
-                logger.error(f"add_custom_indicators: 'ema200' 계산 중 오류 발생: {str(ema_err)}")
-                # ema200 컬럼을 사용하는 기능은 건너뛰기
-                logger.warning("add_custom_indicators: 'distance_from_ema200' 계산을 건너뜁니다.")
-                result['distance_from_ema200'] = np.nan
-        
-        # ema200이 계산되었을 때만 distance_from_ema200 계산
-        if 'ema200' in result.columns and not result['ema200'].isna().all():
-            # ema200에 NaN 값이 있는지 확인
-            nan_ratio = result['ema200'].isna().mean()
-            if nan_ratio > 0:
-                logger.warning(f"add_custom_indicators: 'ema200'에 {nan_ratio:.2%}의 NaN 값이 있습니다.")
-                # 보간 시도
-                if nan_ratio < 0.5:  # NaN 비율이 50% 미만인 경우에만 보간
-                    result['ema200'] = result['ema200'].interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
-                    logger.info("add_custom_indicators: 'ema200'의 NaN 값을 보간했습니다.")
-                else:
-                    logger.warning("add_custom_indicators: NaN 비율이 높아 'distance_from_ema200' 계산을 건너뜁니다.")
-                    result['distance_from_ema200'] = np.nan # NaN 비율 높으면 NaN 처리
-
-            # NaN 값이 없거나 처리된 경우에만 distance_from_ema200 계산 (들여쓰기 수정)
-            if not result['ema200'].isna().all(): # 이 if 블록 전체 들여쓰기 수정
-                result['distance_from_ema200'] = (result['close'] - result['ema200']) / result['ema200'] * 100
-            else:
-                result['distance_from_ema200'] = np.nan # 보간 후에도 NaN이면 NaN 처리
-        else:
-            logger.warning("add_custom_indicators: 유효한 'ema200' 값이 없어 'distance_from_ema200' 계산을 건너뜁니다.")
-            result['distance_from_ema200'] = np.nan
-        
-        # RSI divergence (compare price direction with RSI direction)
-        if 'rsi14' in result.columns:
-            price_diff = result['close'].diff()
-            rsi_diff = result['rsi14'].diff()
-            result['rsi_divergence'] = np.sign(price_diff) * np.sign(rsi_diff)
-        else:
-            logger.warning("add_custom_indicators: 'rsi14' 컬럼이 없어 'rsi_divergence' 계산을 건너뜁니다.")
-            result['rsi_divergence'] = np.nan
-        
-        # Efficiency ratio (how smoothly price moves)
-        price_change = abs(result['close'] - result['close'].shift(14))
-        price_path = result['high'].rolling(14).max() - result['low'].rolling(14).min()
-        # 0으로 나누는 것을 방지
-        zero_path = price_path == 0
-        if zero_path.any():
-            logger.warning(f"add_custom_indicators: 'price_path'에서 {zero_path.sum()}개의 0 값이 발견되었습니다.")
-            price_path = price_path.replace(0, np.nan)
-        result['efficiency_ratio'] = price_change / price_path
-        
-        # Volume profile (relative volume by price level)
-        result['volume_price_ratio'] = result['volume'] / result['close']
-        
-        # 인피니티 값과 NaN 값 처리
-        numeric_cols = result.select_dtypes(include=np.number).columns
-        for col in numeric_cols:
-            if col in result.columns:
-                inf_mask = np.isinf(result[col])
-                if inf_mask.any():
-                    logger.warning(f"add_custom_indicators: '{col}' 컬럼에서 무한대 값이 발견되어 NaN으로 대체합니다.")
-                    result.loc[inf_mask, col] = np.nan
-                    
-                # NaN 갯수 확인
-                nan_count = result[col].isna().sum()
-                if nan_count > 0:
-                    logger.info(f"add_custom_indicators: '{col}' 컬럼에 {nan_count}개의 NaN 값이 있습니다.")
-        
-        logger.info("커스텀 지표들을 성공적으로 추가했습니다.")
-        
-        return result
-    
-    except Exception as e:
-        logger.error(f"커스텀 지표 추가 중 오류 발생: {str(e)}")
+        logger.error(f"MFI 계산 중 오류 발생: {str(e)}")
         logger.error(traceback.format_exc())
-        return df  # Return original DataFrame if error
-
+        return pd.Series(50, index=df.index)  # 오류 발생 시 50 반환
 
 @log_execution
-def add_pattern_recognition(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_chaikin_oscillator(df: pd.DataFrame, fast_period: int = 3, slow_period: int = 10) -> pd.Series:
     """
-    Add candlestick pattern recognition indicators
+    차이킨 오실레이터(Chaikin Oscillator)를 계산합니다.
     
     Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
+        df (pd.DataFrame): OHLCV 데이터가 포함된 데이터프레임
+        fast_period (int): 빠른 EMA 기간
+        slow_period (int): 느린 EMA 기간
         
     Returns:
-        pd.DataFrame: DataFrame with added pattern indicators
+        pd.Series: 차이킨 오실레이터 값 시리즈
     """
-    if df is None or df.empty:
-        logger.warning("add_pattern_recognition: 입력 DataFrame이 비어 있습니다.")
-        return df
-        
-    # Make a copy to avoid modifying the original
-    result = df.copy()
-    
     try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"add_pattern_recognition: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return df
+        # 입력 유효성 검사
+        if not isinstance(df, pd.DataFrame):
+            logger.error(f"입력이 DataFrame이 아닙니다: {type(df)}")
+            return pd.Series(np.nan, index=range(len(df) if hasattr(df, '__len__') else 0))
         
-        # 컬럼 데이터를 숫자형으로 변환
-        for col in required_columns:
-            if not pd.api.types.is_numeric_dtype(result[col]):
-                logger.info(f"add_pattern_recognition: '{col}' 컬럼을 숫자형으로 변환합니다.")
-                result[col] = pd.to_numeric(result[col], errors='coerce')
+        required_cols = ['high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            logger.error(f"차이킨 오실레이터 계산에 필요한 컬럼이 없습니다. 필요: {required_cols}")
+            return pd.Series(np.nan, index=df.index)
         
-        # 충분한 데이터가 있는지 확인
-        if len(result) < 4:  # 캔들 패턴 중 최대 4개의 캔들이 필요함
-            logger.warning(f"add_pattern_recognition: 데이터 길이가 너무 짧습니다 ({len(result)} < 4)")
-            return df
+        # 데이터 변환
+        high = pd.to_numeric(df['high'], errors='coerce')
+        low = pd.to_numeric(df['low'], errors='coerce')
+        close = pd.to_numeric(df['close'], errors='coerce')
+        volume = pd.to_numeric(df['volume'], errors='coerce')
         
-        # Doji pattern
-        result['doji'] = identify_doji(result)
+        # A/D Line 계산
+        mfm = ((close - low) - (high - close)) / (high - low)
+        mfm = mfm.replace([np.inf, -np.inf], 0)  # 0으로 나누는 경우 처리
+        mfm = mfm.fillna(0)  # NaN 값 처리
         
-        # Hammer and Hanging Man
-        result['hammer'] = identify_hammer(result)
+        mfv = mfm * volume
+        ad_line = mfv.cumsum()
         
-        # Engulfing pattern
-        result['bullish_engulfing'] = identify_bullish_engulfing(result)
-        result['bearish_engulfing'] = identify_bearish_engulfing(result)
+        # 빠른 EMA와 느린 EMA 계산
+        ad_ema_fast = ad_line.ewm(span=fast_period, adjust=False).mean()
+        ad_ema_slow = ad_line.ewm(span=slow_period, adjust=False).mean()
         
-        # Morning star and Evening star
-        result['morning_star'] = identify_morning_star(result)
-        result['evening_star'] = identify_evening_star(result)
+        # 차이킨 오실레이터 계산
+        chaikin_osc = ad_ema_fast - ad_ema_slow
         
-        # Three Line Strike
-        result['three_line_strike'] = identify_three_line_strike(result)
+        # NaN 값 처리
+        chaikin_osc = chaikin_osc.fillna(0)
         
-        logger.info("캔들스틱 패턴 인식 지표들을 성공적으로 추가했습니다.")
-        
-        return result
-    
+        return chaikin_osc
     except Exception as e:
-        logger.error(f"캔들스틱 패턴 인식 지표 추가 중 오류 발생: {str(e)}")
+        logger.error(f"차이킨 오실레이터 계산 중 오류 발생: {str(e)}")
         logger.error(traceback.format_exc())
-        return df  # Return original DataFrame if error
-
-
-@log_execution
-def identify_doji(df: pd.DataFrame, doji_size: float = 0.05) -> pd.Series:
-    """
-    Identify Doji candlestick pattern
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        doji_size (float, optional): Maximum size of the body relative to the candle range. Defaults to 0.05.
-        
-    Returns:
-        pd.Series: Boolean series indicating Doji patterns
-    """
-    try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"identify_doji: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return pd.Series(False, index=df.index)
-        
-        # 입력 데이터를 숫자형으로 변환
-        open_prices = pd.to_numeric(df['open'], errors='coerce')
-        high_prices = pd.to_numeric(df['high'], errors='coerce')
-        low_prices = pd.to_numeric(df['low'], errors='coerce')
-        close_prices = pd.to_numeric(df['close'], errors='coerce')
-        
-        # Calculate body size
-        body_size = abs(close_prices - open_prices)
-        
-        # Calculate candle range
-        candle_range = high_prices - low_prices
-        
-        # Identify Doji: small body compared to range
-        doji = (body_size / candle_range) < doji_size
-        
-        # Ensure candle has some range to avoid division by zero
-        doji = doji & (candle_range > 0)
-        
-        # Replace NaN values with False
-        doji = doji.fillna(False)
-        
-        return doji
-    
-    except Exception as e:
-        logger.error(f"Error in identify_doji: {str(e)}")
-        return pd.Series(False, index=df.index)
-
-
-@log_execution
-def identify_hammer(df: pd.DataFrame) -> pd.Series:
-    """
-    Identify Hammer and Hanging Man candlestick patterns
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        
-    Returns:
-        pd.Series: Series with values indicating pattern (1 for hammer, -1 for hanging man, 0 for neither)
-    """
-    try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"identify_hammer: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return pd.Series(0, index=df.index)
-        
-        if len(df) < 3:
-            logger.warning("identify_hammer: 데이터가 3개 이하입니다. 최소 3개의 데이터가 필요합니다.")
-            return pd.Series(0, index=df.index)
-            
-        # 입력 데이터를 숫자형으로 변환
-        open_prices = pd.to_numeric(df['open'], errors='coerce')
-        high_prices = pd.to_numeric(df['high'], errors='coerce')
-        low_prices = pd.to_numeric(df['low'], errors='coerce')
-        close_prices = pd.to_numeric(df['close'], errors='coerce')
-        
-        # Calculate body size, upper shadow, lower shadow
-        body_size = abs(close_prices - open_prices)
-        
-        # Determine the trend (looking back at 3 candles)
-        uptrend = close_prices.rolling(3).mean().shift(1) > close_prices.rolling(7).mean().shift(1)
-        downtrend = close_prices.rolling(3).mean().shift(1) < close_prices.rolling(7).mean().shift(1)
-        
-        # For hammer/hanging man, we want small upper shadow and long lower shadow
-        upper_shadow = high_prices - pd.DataFrame({'open': open_prices, 'close': close_prices}).max(axis=1)
-        lower_shadow = pd.DataFrame({'open': open_prices, 'close': close_prices}).min(axis=1) - low_prices
-        
-        # Conditions for hammer/hanging man
-        small_upper_shadow = upper_shadow < 0.2 * body_size
-        long_lower_shadow = lower_shadow > 2 * body_size
-        
-        # Hammer (in downtrend) and Hanging Man (in uptrend)
-        hammer = (small_upper_shadow & long_lower_shadow & downtrend).astype(int)
-        hanging_man = (small_upper_shadow & long_lower_shadow & uptrend).astype(int) * -1
-        
-        # NaN 값을 0으로 대체
-        result = hammer + hanging_man
-        result = result.fillna(0)
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error in identify_hammer: {str(e)}")
-        return pd.Series(0, index=df.index)
-
-
-@log_execution
-def identify_bullish_engulfing(df: pd.DataFrame) -> pd.Series:
-    """
-    Identify Bullish Engulfing candlestick pattern
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        
-    Returns:
-        pd.Series: Boolean series indicating Bullish Engulfing patterns
-    """
-    try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"identify_bullish_engulfing: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return pd.Series(False, index=df.index)
-                
-        if len(df) < 2:
-            logger.warning("identify_bullish_engulfing: 데이터가 2개 이하입니다. 최소 2개의 데이터가 필요합니다.")
-            return pd.Series(False, index=df.index)
-        
-        # 입력 데이터를 숫자형으로 변환
-        open_prices = pd.to_numeric(df['open'], errors='coerce')
-        close_prices = pd.to_numeric(df['close'], errors='coerce')
-        
-        # Prior candle is bearish (close < open)
-        prior_bearish = close_prices.shift(1) < open_prices.shift(1)
-        
-        # Current candle is bullish (close > open)
-        current_bullish = close_prices > open_prices
-        
-        # Current candle's body engulfs prior candle's body
-        engulfing = (open_prices < close_prices.shift(1)) & (close_prices > open_prices.shift(1))
-        
-        # Combine conditions
-        bullish_engulfing = prior_bearish & current_bullish & engulfing
-        
-        # NaN 값을 False로 대체
-        bullish_engulfing = bullish_engulfing.fillna(False)
-        
-        return bullish_engulfing
-    
-    except Exception as e:
-        logger.error(f"Error in identify_bullish_engulfing: {str(e)}")
-        return pd.Series(False, index=df.index)
-
-
-@log_execution
-def identify_bearish_engulfing(df: pd.DataFrame) -> pd.Series:
-    """
-    Identify Bearish Engulfing candlestick pattern
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        
-    Returns:
-        pd.Series: Boolean series indicating Bearish Engulfing patterns
-    """
-    try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"identify_bearish_engulfing: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return pd.Series(False, index=df.index)
-                
-        if len(df) < 2:
-            logger.warning("identify_bearish_engulfing: 데이터가 2개 이하입니다. 최소 2개의 데이터가 필요합니다.")
-            return pd.Series(False, index=df.index)
-        
-        # 입력 데이터를 숫자형으로 변환
-        open_prices = pd.to_numeric(df['open'], errors='coerce')
-        close_prices = pd.to_numeric(df['close'], errors='coerce')
-        
-        # Prior candle is bullish (close > open)
-        prior_bullish = close_prices.shift(1) > open_prices.shift(1)
-        
-        # Current candle is bearish (close < open)
-        current_bearish = close_prices < open_prices
-        
-        # Current candle's body engulfs prior candle's body
-        engulfing = (open_prices > close_prices.shift(1)) & (close_prices < open_prices.shift(1))
-        
-        # Combine conditions
-        bearish_engulfing = prior_bullish & current_bearish & engulfing
-        
-        # NaN 값을 False로 대체
-        bearish_engulfing = bearish_engulfing.fillna(False)
-        
-        return bearish_engulfing
-    
-    except Exception as e:
-        logger.error(f"Error in identify_bearish_engulfing: {str(e)}")
-        return pd.Series(False, index=df.index)
-
-
-@log_execution
-def identify_morning_star(df: pd.DataFrame) -> pd.Series:
-    """
-    Identify Morning Star candlestick pattern
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        
-    Returns:
-        pd.Series: Boolean series indicating Morning Star patterns
-    """
-    try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"identify_morning_star: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return pd.Series(False, index=df.index)
-                
-        if len(df) < 3:
-            logger.warning("identify_morning_star: 데이터가 3개 이하입니다. 최소 3개의 데이터가 필요합니다.")
-            return pd.Series(False, index=df.index)
-        
-        # 입력 데이터를 숫자형으로 변환
-        open_prices = pd.to_numeric(df['open'], errors='coerce')
-        high_prices = pd.to_numeric(df['high'], errors='coerce')
-        low_prices = pd.to_numeric(df['low'], errors='coerce')
-        close_prices = pd.to_numeric(df['close'], errors='coerce')
-        
-        # First candle is bearish
-        first_bearish = close_prices.shift(2) < open_prices.shift(2)
-        
-        # Second candle is small
-        second_small = abs(close_prices.shift(1) - open_prices.shift(1)) < 0.3 * abs(close_prices.shift(2) - open_prices.shift(2))
-        
-        # Third candle is bullish and closes above midpoint of first candle
-        third_bullish = close_prices > open_prices
-        midpoint_first = (open_prices.shift(2) + close_prices.shift(2)) / 2
-        third_above_midpoint = close_prices > midpoint_first
-        
-        # Gap down between first and second candles
-        gap_down = high_prices.shift(1) < low_prices.shift(2)
-        
-        # Combine conditions
-        morning_star = first_bearish & second_small & third_bullish & third_above_midpoint & gap_down
-        
-        # NaN 값을 False로 대체
-        morning_star = morning_star.fillna(False)
-        
-        return morning_star
-    
-    except Exception as e:
-        logger.error(f"Error in identify_morning_star: {str(e)}")
-        return pd.Series(False, index=df.index)
-
-
-@log_execution
-def identify_evening_star(df: pd.DataFrame) -> pd.Series:
-    """
-    Identify Evening Star candlestick pattern
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        
-    Returns:
-        pd.Series: Boolean series indicating Evening Star patterns
-    """
-    try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"identify_evening_star: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return pd.Series(False, index=df.index)
-                
-        if len(df) < 3:
-            logger.warning("identify_evening_star: 데이터가 3개 이하입니다. 최소 3개의 데이터가 필요합니다.")
-            return pd.Series(False, index=df.index)
-        
-        # 입력 데이터를 숫자형으로 변환
-        open_prices = pd.to_numeric(df['open'], errors='coerce')
-        high_prices = pd.to_numeric(df['high'], errors='coerce')
-        low_prices = pd.to_numeric(df['low'], errors='coerce')
-        close_prices = pd.to_numeric(df['close'], errors='coerce')
-        
-        # First candle is bullish
-        first_bullish = close_prices.shift(2) > open_prices.shift(2)
-        
-        # Second candle is small
-        second_small = abs(close_prices.shift(1) - open_prices.shift(1)) < 0.3 * abs(close_prices.shift(2) - open_prices.shift(2))
-        
-        # Third candle is bearish and closes below midpoint of first candle
-        third_bearish = close_prices < open_prices
-        midpoint_first = (open_prices.shift(2) + close_prices.shift(2)) / 2
-        third_below_midpoint = close_prices < midpoint_first
-        
-        # Gap up between first and second candles
-        gap_up = low_prices.shift(1) > high_prices.shift(2)
-        
-        # Combine conditions
-        evening_star = first_bullish & second_small & third_bearish & third_below_midpoint & gap_up
-        
-        # NaN 값을 False로 대체
-        evening_star = evening_star.fillna(False)
-        
-        return evening_star
-    
-    except Exception as e:
-        logger.error(f"Error in identify_evening_star: {str(e)}")
-        return pd.Series(False, index=df.index)
-
-
-@log_execution
-def identify_three_line_strike(df: pd.DataFrame) -> pd.Series:
-    """
-    Identify Three Line Strike candlestick pattern
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        
-    Returns:
-        pd.Series: Series with values indicating pattern (1 for bullish, -1 for bearish, 0 for neither)
-    """
-    try:
-        # 필요한 컬럼 확인
-        required_columns = ['open', 'high', 'low', 'close']
-        for col in required_columns:
-            if col not in df.columns:
-                logger.error(f"identify_three_line_strike: 필수 컬럼 '{col}'이(가) 없습니다.")
-                return pd.Series(0, index=df.index)
-                
-        if len(df) < 4:
-            logger.warning("identify_three_line_strike: 데이터가 4개 이하입니다. 최소 4개의 데이터가 필요합니다.")
-            return pd.Series(0, index=df.index)
-        
-        # 입력 데이터를 숫자형으로 변환
-        open_prices = pd.to_numeric(df['open'], errors='coerce')
-        close_prices = pd.to_numeric(df['close'], errors='coerce')
-        
-        # Bullish Three Line Strike
-        three_bullish_candles = (
-            (close_prices.shift(3) > open_prices.shift(3)) &  # First candle bullish
-            (close_prices.shift(2) > open_prices.shift(2)) &  # Second candle bullish
-            (close_prices.shift(1) > open_prices.shift(1)) &  # Third candle bullish
-            (close_prices.shift(2) > close_prices.shift(3)) &  # Each close higher than previous
-            (close_prices.shift(1) > close_prices.shift(2))
-        )
-        
-        bearish_fourth = (
-            (open_prices > close_prices.shift(1)) &  # Fourth opens above third close
-            (close_prices < open_prices.shift(3))    # Fourth closes below first open
-        )
-        
-        bullish_pattern = three_bullish_candles & bearish_fourth
-        
-        # Bearish Three Line Strike
-        three_bearish_candles = (
-            (close_prices.shift(3) < open_prices.shift(3)) &  # First candle bearish
-            (close_prices.shift(2) < open_prices.shift(2)) &  # Second candle bearish
-            (close_prices.shift(1) < open_prices.shift(1)) &  # Third candle bearish
-            (close_prices.shift(2) < close_prices.shift(3)) &  # Each close lower than previous
-            (close_prices.shift(1) < close_prices.shift(2))
-        )
-        
-        bullish_fourth = (
-            (open_prices < close_prices.shift(1)) &  # Fourth opens below third close
-            (close_prices > open_prices.shift(3))    # Fourth closes above first open
-        )
-        
-        bearish_pattern = three_bearish_candles & bullish_fourth
-        
-        # Combine into a single series
-        result = bullish_pattern.astype(int) - bearish_pattern.astype(int)
-        
-        # NaN 값을 0으로 대체
-        result = result.fillna(0)
-        
-        return result
-    
-    except Exception as e:
-        logger.error(f"Error in identify_three_line_strike: {str(e)}")
-        return pd.Series(0, index=df.index)
-
-
-@log_execution
-def handle_nan_values(df: pd.DataFrame) -> pd.DataFrame:
-     """ Handle NaN values in the DataFrame after indicator calculation """
-     result = df.copy()
-     total_nan_sum = result.isna().sum().sum()
-     total_nan_count = int(total_nan_sum.item()) if hasattr(total_nan_sum, 'item') else int(total_nan_sum)
-
-     if total_nan_count > 0:
-          logger.info(f"지표 계산 후 {total_nan_count}개의 NaN 값이 남아있어 처리합니다.")
-          numeric_cols = result.select_dtypes(include=np.number).columns.tolist()
-
-          for col in numeric_cols:
-               col_nan_sum = result[col].isna().sum()
-               col_nan_count = int(col_nan_sum.item()) if hasattr(col_nan_sum, 'item') else int(col_nan_sum)
-
-               if col_nan_count > 0:
-                    if col_nan_count == len(result):
-                         fill_value = 0
-                         result[col] = fill_value
-                         logger.info(f"컬럼 '{col}' 전체가 NaN이므로 {fill_value}로 대체했습니다.")
-                    else:
-                         try:
-                              # Try filling with median first
-                              fill_value = result[col].median()
-                              if pd.isna(fill_value):
-                                   # If median is NaN, try mean
-                                   fill_value = result[col].mean()
-                                   if pd.isna(fill_value):
-                                        # If mean is also NaN, use 0
-                                        fill_value = 0
-                              result[col] = result[col].fillna(fill_value)
-                              logger.info(f"컬럼 '{col}'의 {col_nan_count}개 NaN 값을 {fill_value}(median/mean/0)로 대체했습니다.")
-                         except Exception as fill_e:
-                              logger.warning(f"컬럼 '{col}' NaN 처리 중 오류 발생 ({fill_e}). 0으로 대체합니다.")
-                              result[col] = result[col].fillna(0)
-     return result
-
-@log_execution
-def calculate_percent_b(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 20, window_dev: int = 2) -> pd.Series:
-    """Calculate Bollinger Bands %B"""
-    try:
-        # Ensure inputs are numeric
-        high = pd.to_numeric(high, errors='coerce')
-        low = pd.to_numeric(low, errors='coerce')
-        close = pd.to_numeric(close, errors='coerce')
-
-        if high.isnull().all() or low.isnull().all() or close.isnull().all():
-            logger.warning("%B 계산 입력 데이터에 문제가 있습니다.")
-            return pd.Series(np.nan, index=close.index)
-
-        bollinger = BollingerBands(close=close, window=window, window_dev=window_dev, fillna=True)
-        bb_high = bollinger.bollinger_hband()
-        bb_low = bollinger.bollinger_lband()
-        
-        # Avoid division by zero when bands are equal
-        band_diff = bb_high - bb_low
-        percent_b = (close - bb_low) / band_diff.replace(0, np.nan) # Replace 0 with NaN before division
-
-        percent_b.replace([np.inf, -np.inf], np.nan, inplace=True) # Handle division by zero/inf
-        # Fill NaNs (from division by zero or initial calculation)
-        return percent_b.fillna(method='ffill').fillna(method='bfill').fillna(0.5) # Fill remaining NaNs with 0.5 (mid-band)
-    except Exception as e:
-        logger.error(f"Error calculating %B: {e}")
-        logger.debug(traceback.format_exc())
-        return pd.Series(np.nan, index=close.index)
-
-@log_execution
-def calculate_cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, window: int = 20) -> pd.Series:
-    """Calculate Chaikin Money Flow (CMF)"""
-    try:
-        # Ensure inputs are numeric
-        high = pd.to_numeric(high, errors='coerce')
-        low = pd.to_numeric(low, errors='coerce')
-        close = pd.to_numeric(close, errors='coerce')
-        volume = pd.to_numeric(volume, errors='coerce')
-
-        if high.isnull().all() or low.isnull().all() or close.isnull().all() or volume.isnull().all():
-            logger.warning("CMF 계산 입력 데이터에 문제가 있습니다.")
-            return pd.Series(np.nan, index=close.index)
-
-        # Avoid division by zero if high equals low
-        hl_diff = (high - low).replace(0, np.nan) # Replace 0 difference with NaN
-
-        # Calculate Money Flow Multiplier safely
-        mfm = ((close - low) - (high - close)) / hl_diff
-        mfm = mfm.fillna(0) # Fill NaNs where high == low or calculation resulted in NaN
-
-        # Calculate Money Flow Volume
-        mfv = mfm * volume.fillna(0) # Use filled volume
-
-        # Calculate CMF denominator safely
-        vol_sum = volume.rolling(window=window, min_periods=1).sum().replace(0, np.nan)
-
-        cmf = mfv.rolling(window=window, min_periods=1).sum() / vol_sum
-        cmf.replace([np.inf, -np.inf], np.nan, inplace=True) # Handle potential division by zero
-        return cmf.fillna(method='ffill').fillna(method='bfill').fillna(0) # Fill NaNs with 0
-
-    except Exception as e:
-        logger.error(f"Error calculating CMF: {e}")
-        logger.debug(traceback.format_exc())
-        return pd.Series(np.nan, index=close.index)
-
-
-@log_execution
-def calculate_ema_dist_norm(close: pd.Series, window_fast: int = 12, window_slow: int = 26) -> pd.Series:
-    """Calculate normalized distance between fast and slow EMAs"""
-    try:
-        close_numeric = pd.to_numeric(close, errors='coerce')
-        if close_numeric.isnull().all():
-             logger.warning("EMA Distance Norm 계산 입력 데이터(close)에 문제가 있습니다.")
-             return pd.Series(np.nan, index=close.index)
-
-        ema_fast = EMAIndicator(close=close_numeric, window=window_fast, fillna=True).ema_indicator()
-        ema_slow = EMAIndicator(close=close_numeric, window=window_slow, fillna=True).ema_indicator()
-        ema_dist = ema_fast - ema_slow
-
-        # Normalize the distance using division by close price (handle zero close price)
-        close_safe = close_numeric.replace(0, np.nan)
-        ema_dist_norm = ema_dist / close_safe
-
-        ema_dist_norm.replace([np.inf, -np.inf], np.nan, inplace=True)
-        # Fill NaNs (from division by zero or initial calculation)
-        return ema_dist_norm.fillna(method='ffill').fillna(method='bfill').fillna(0) # Fill remaining NaNs with 0
-    except Exception as e:
-        logger.error(f"Error calculating EMA Distance Norm: {e}")
-        logger.debug(traceback.format_exc())
-        return pd.Series(np.nan, index=close.index)
-
-@log_execution
-def calculate_all_indicators(df: pd.DataFrame, timeframe: str = None) -> pd.DataFrame:
-    """
-    Calculate all technical indicators ensuring consistent columns.
-    
-    Args:
-        df (pd.DataFrame): DataFrame with OHLCV data
-        timeframe (str, optional): Timeframe identifier for logging. Defaults to None.
-        
-    Returns:
-        pd.DataFrame: DataFrame with all indicators
-    """
-    if df is None or df.empty:
-        logger.warning(f"입력 DataFrame이 비어 있어 지표를 계산할 수 없습니다. timeframe: {timeframe or '알 수 없음'}")
-        # 빈 DataFrame에 모든 가능한 컬럼 추가하여 반환
-        all_cols = df.columns.tolist() if df is not None else []
-        all_cols = all_cols + ALL_POSSIBLE_INDICATOR_COLUMNS
-        return pd.DataFrame(columns=list(dict.fromkeys(all_cols)))  # 중복 제거된 컬럼 목록
-
-    logger.info(f"'{timeframe or '알 수 없는 기간'}'에 대한 모든 기술적 지표 계산 시작")
-    logger.debug(f"입력 데이터 크기: {df.shape}, 컬럼: {df.columns.tolist()}, 인덱스 타입: {type(df.index)}")
-    
-    # 안전한 데이터프레임 복사
-    try:
-        # 인덱스 타입 확인 및 변환
-        result = df.copy(deep=True)
-        
-        # 데이터타임 인덱스 확인 및 변환
-        if not isinstance(result.index, pd.DatetimeIndex):
-            try:
-                logger.info("인덱스를 DatetimeIndex로 변환합니다.")
-                # 인덱스 이름 저장
-                index_name = result.index.name
-                
-                # 인덱스를 datetime으로 변환
-                result.index = pd.to_datetime(result.index, errors='coerce')
-                
-                # 변환 실패한 경우 (NaT) 확인
-                nat_count = result.index.isna().sum()
-                if nat_count > 0:
-                    logger.warning(f"인덱스 변환 중 {nat_count}개의 NaT가 발생했습니다.")
-                    # NaT 인덱스 제거
-                    result = result[~result.index.isna()]
-                    if result.empty:
-                        logger.error("모든 인덱스가 NaT로 변환되어 빈 DataFrame이 됐습니다.")
-                        return pd.DataFrame(columns=df.columns.tolist() + ALL_POSSIBLE_INDICATOR_COLUMNS)
-                
-                # 인덱스 이름 복원
-                if index_name:
-                    result.index.name = index_name
-                
-                logger.info(f"인덱스 변환 완료. 변환 후 크기: {result.shape}")
-            except Exception as e:
-                logger.error(f"인덱스 변환 실패: {str(e)}")
-                logger.warning("원본 인덱스를 유지합니다.")
-        
-        # 인덱스 정렬 - 중요: 시간 순서대로 정렬하여 계산 보장
-        try:
-            # 중복 인덱스 확인
-            if result.index.duplicated().any():
-                dup_count = result.index.duplicated().sum()
-                logger.warning(f"중복된 인덱스가 {dup_count}개 발견되었습니다. 첫 번째 값을 유지합니다.")
-                result = result[~result.index.duplicated(keep='first')]
-            
-            # 인덱스 정렬
-            result = result.sort_index()
-        except Exception as e:
-            logger.error(f"인덱스 정렬 실패: {str(e)}")
-            logger.warning("정렬 없이 계속 진행합니다.")
-        
-        # 필수 컬럼 확인
-        required_cols = ['open', 'high', 'low', 'close', 'volume']
-        missing_cols = [col for col in required_cols if col not in result.columns]
-        if missing_cols:
-            logger.error(f"필수 컬럼이 누락되었습니다: {missing_cols}")
-            # 누락된 컬럼을 NaN으로 추가
-            for col in missing_cols:
-                logger.warning(f"누락된 컬럼 '{col}'을 NaN으로 추가합니다.")
-                result[col] = np.nan
-        
-        # 데이터 타입 확인 및 변환
-        for col in required_cols:
-            if col in result.columns and not pd.api.types.is_numeric_dtype(result[col]):
-                logger.warning(f"컬럼 '{col}'이 숫자형이 아닙니다. 숫자형으로 변환합니다.")
-                original_type = result[col].dtype
-                result[col] = pd.to_numeric(result[col], errors='coerce')
-                nan_count = result[col].isna().sum()
-                if nan_count > 0:
-                    logger.warning(f"'{col}' 변환 중 {nan_count}개의 NaN이 발생했습니다.")
-        
-        # NaN 값 초기 확인
-        nan_count_before = result[required_cols].isna().sum().sum()
-        if nan_count_before > 0:
-            logger.warning(f"지표 계산 전 필수 컬럼에 {nan_count_before}개의 NaN이 있습니다.")
-            # 연속된 NaN이 너무 많으면 경고
-            max_consecutive_nans = max(result[required_cols].isna().sum(axis=1))
-            if max_consecutive_nans >= 3:  # 한 행에 3개 이상의 NaN이 있으면 경고
-                logger.warning(f"일부 행에 너무 많은 NaN이 있습니다 (최대 {max_consecutive_nans}/5개).")
-            
-            # NaN을 앞/뒤 값으로 채움
-            for col in required_cols:
-                if col in result.columns:
-                    na_count = result[col].isna().sum()
-                    if na_count > 0:
-                        before = na_count
-                        result[col] = result[col].fillna(method='ffill').fillna(method='bfill')
-                        after = result[col].isna().sum()
-                        logger.info(f"'{col}' 컬럼의 NaN을 {before}개 → {after}개로 처리했습니다.")
-    except Exception as e:
-        logger.error(f"DataFrame 준비 중 오류 발생: {str(e)}")
-        logger.error(traceback.format_exc())
-        # 오류 발생 시 원본 데이터프레임 사용
-        logger.warning("원본 DataFrame을 사용하여 진행합니다.")
-    result = df.copy()
-
-    # 원본 컬럼 목록 저장
-    original_columns = result.columns.tolist()
-    
-    # 모든 가능한 지표 컬럼 초기화 (존재하지 않는 경우에만)
-    for col in ALL_POSSIBLE_INDICATOR_COLUMNS:
-        if col not in result.columns:
-            result[col] = np.nan
-
-    # 각 지표 함수 정의
-    indicator_functions = [
-        add_basic_indicators,
-        add_advanced_indicators,
-        add_custom_indicators,
-        add_pattern_recognition
-    ]
-
-    # 지표 계산 적용
-    for indicator_func in indicator_functions:
-        func_name = indicator_func.__name__
-        try:
-            logger.debug(f"{func_name} 적용 중...")
-
-            # 함수 실행을 위한 안전한 데이터프레임 복사
-            temp_df = result.copy(deep=True)
-
-            # 타입 변환 및 NaN 처리 재확인
-            required_cols = ['open', 'high', 'low', 'close', 'volume']
-            for col in required_cols:
-                if col in temp_df.columns:
-                    if not pd.api.types.is_numeric_dtype(temp_df[col]):
-                        temp_df[col] = pd.to_numeric(temp_df[col], errors='coerce')
-                    if temp_df[col].isna().any():
-                        temp_df[col] = temp_df[col].fillna(method='ffill').fillna(method='bfill')
-
-            # 함수 실행
-            indicator_df = indicator_func(temp_df)
-
-            # 실행 결과 검증
-            if indicator_df is None:
-                logger.error(f"{func_name} 실행 결과가 None입니다.")
-                continue # 다음 함수로 넘어감
-
-            if indicator_df.empty:
-                logger.error(f"{func_name} 실행 결과가 빈 DataFrame입니다.")
-                continue # 다음 함수로 넘어감
-
-            # 인덱스 호환성 확인 및 처리
-            if not result.index.equals(indicator_df.index):
-                logger.warning(f"{func_name} 실행 결과의 인덱스가 원본과 다릅니다. 재조정 시도.")
-                try:
-                    indicator_df_reindexed = indicator_df.reindex(result.index)
-                    # Check if reindexing created too many NaNs (optional)
-                    # if indicator_df_reindexed.isna().sum().sum() > indicator_df.isna().sum().sum() * 1.1:
-                    #     logger.warning("Reindexing created many NaNs. Skipping merge for this function.")
-                    #     continue
-                    indicator_df = indicator_df_reindexed
-                except Exception as idx_err:
-                    logger.error(f"인덱스 재조정 중 오류: {str(idx_err)}. {func_name} 결과 적용 건너뜀.")
-                    continue # 다음 함수로 넘어감
-
-            # 계산된 지표를 원본 결과에 병합
-            new_cols = [col for col in indicator_df.columns if col not in original_columns]
-
-            if not new_cols:
-                logger.debug(f"{func_name}에서 새로운 컬럼이 생성되지 않았습니다.")
-                continue # 다음 함수로 넘어감
-
-            # 컬럼별로 데이터 복사 (인덱스 기준으로)
-            for col in new_cols:
-                if col in indicator_df.columns:
-                    # Use loc for safer index alignment during assignment
-                    result.loc[:, col] = indicator_df.loc[:, col]
-
-            logger.debug(f"{func_name} 적용 완료. {len(new_cols)}개 컬럼 추가됨")
-
-        except Exception as e: # 여기가 try 블록(1683라인)에 대한 except 블록
-            logger.error(f"{func_name} 적용 중 오류 발생: {str(e)}")
-            logger.error(traceback.format_exc())
-    
-    # NaN 비율 확인
-    indicator_cols = [col for col in result.columns if col not in original_columns]
-    if indicator_cols:
-        nan_ratio = result[indicator_cols].isna().mean().mean()
-        logger.info(f"지표 컬럼의 평균 NaN 비율: {nan_ratio:.2%}")
-        
-        # 지표별 NaN 비율이 높은 컬럼 로깅
-        high_nan_cols = []
-        for col in indicator_cols:
-            col_nan_ratio = result[col].isna().mean()
-            if col_nan_ratio > 0.5:  # 50% 이상 NaN인 컬럼
-                high_nan_cols.append((col, col_nan_ratio))
-        
-        if high_nan_cols:
-            logger.warning(f"NaN 비율이 높은 지표들: {high_nan_cols}")
-    
-    # 데이터 길이 확인
-    min_required_rows = 200  # 가장 긴 지표 기간 기준으로 조정
-    if len(result) < min_required_rows:
-        logger.warning(f"데이터 길이({len(result)})가 신뢰할 수 있는 지표 계산에 너무 짧을 수 있습니다.")
-    
-    # NaN 값 처리
-    try:
-        logger.info("NaN 값 처리 시작...")
-        result = handle_nan_values(result)
-        logger.info("NaN 값 처리 완료")
-    except Exception as e:
-        logger.error(f"NaN 처리 중 오류 발생: {str(e)}")
-        logger.error(traceback.format_exc())
-        
-        # 기본 NaN 처리 방법 적용
-        logger.warning("기본 NaN 처리 방법을 적용합니다.")
-        for col in result.columns:
-            if col not in original_columns:
-                na_count_before = result[col].isna().sum()
-                if na_count_before > 0:
-                    # 앞의 값으로 채우기 -> 뒤의 값으로 채우기 -> 0으로 채우기
-                    result[col] = result[col].fillna(method='ffill').fillna(method='bfill').fillna(0)
-                    na_count_after = result[col].isna().sum()
-                    
-                    # 모든 값이 NaN인 경우 특별 처리
-                    if na_count_after == len(result):
-                        logger.warning(f"컬럼 '{col}' 전체가 NaN이므로 0로 대체했습니다.")
-                        result[col] = 0
-
-    # 누락된 컬럼 확인 및 추가
-    final_columns = original_columns + [col for col in ALL_POSSIBLE_INDICATOR_COLUMNS 
-                                       if col not in original_columns]
-    missing_columns = [col for col in final_columns if col not in result.columns]
-    
-    for col in missing_columns:
-        logger.warning(f"컬럼 '{col}'이 예기치 않게 누락되었습니다. 0으로 추가합니다.")
-        result[col] = 0
-    
-    # 컬럼 순서 정리 (중복 제거 및 순서 유지)
-    unique_final_columns = list(dict.fromkeys(final_columns))
-    try:
-        result = result[unique_final_columns]
-    except KeyError as e:
-        logger.error(f"컬럼 재정렬 중 오류: {str(e)}")
-        # 실패하면 기존 컬럼 유지
-    
-    # 결과 데이터프레임 검증
-    logger.info(f"모든 지표 계산 완료. 최종 크기: {result.shape}")
-    
-    # 데이터 무결성 검사
-    if result.isna().any().any():
-        nan_count = result.isna().sum().sum()
-        logger.warning(f"결과에 {nan_count}개의 NaN이 있습니다. 남은 NaN을 0으로 채웁니다.")
-        result = result.fillna(0)
-    
-    # 인덱스 중복 확인
-    if result.index.duplicated().any():
-        dup_count = result.index.duplicated().sum()
-        logger.warning(f"결과에 {dup_count}개의 중복 인덱스가 있습니다. 이로 인해 문제가 발생할 수 있습니다.")
-    
-    # 데이터 유형 불일치 확인 (문자열 컬럼 등)
-    non_numeric_cols = result.select_dtypes(exclude=['number']).columns.tolist()
-    if non_numeric_cols:
-        logger.warning(f"결과에 비숫자형 컬럼이 있습니다: {non_numeric_cols}")
-        
-        # 비숫자형 컬럼 변환 시도
-        for col in non_numeric_cols:
-            try:
-                result[col] = pd.to_numeric(result[col], errors='coerce').fillna(0)
-                logger.info(f"컬럼 '{col}'을 숫자형으로 변환했습니다.")
-            except Exception as e:
-                logger.error(f"컬럼 '{col}' 변환 중 오류: {str(e)}")
-    
-    # 최종 무결성 검사
-    final_inf_check = np.isinf(result.select_dtypes(include=['number'])).any().any()
-    if final_inf_check:
-        logger.warning("최종 결과에 무한값(inf)이 있습니다. 0으로 대체합니다.")
-        result = result.replace([np.inf, -np.inf], 0)
-
-    return result
-
-# 이전 버전과의 호환성을 위한 별칭
-add_indicators = calculate_all_indicators
-
-
-@log_execution
-def filter_indicators(df: pd.DataFrame, indicators: List[str] = None) -> pd.DataFrame:
-    """
-    Filter DataFrame to include only specified indicators
-    
-    Args:
-        df (pd.DataFrame): DataFrame with all indicators
-        indicators (List[str], optional): List of indicator column names to keep. 
-                                         If None, returns all columns.
-                                         
-    Returns:
-        pd.DataFrame: Filtered DataFrame
-    """
-    if indicators is None:
-        return df
-    
-    # Always include OHLCV columns
-    essential_columns = ['open', 'high', 'low', 'close', 'volume']
-    
-    # Add 'ticker' column if it exists
-    if 'ticker' in df.columns:
-        essential_columns.append('ticker')
-    
-    # Filter columns
-    available_indicators = [col for col in indicators if col in df.columns]
-    all_columns = essential_columns + available_indicators
-    
-    # Get unique columns (in case there are duplicates)
-    unique_columns = list(dict.fromkeys(all_columns))
-    
-    # Return filtered DataFrame
-    return df[unique_columns] 
+        return pd.Series(0, index=df.index)  # 오류 발생 시 0 반환

@@ -1,39 +1,53 @@
 """
-Models Package for Bitcoin Trading System
+Models package
 
-This package contains all the ML models used in the trading system,
-including time-series models, classification models and reinforcement learning models.
+Contains model implementations for trading systems.
 """
 
-import os
-from typing import Dict, Type, List
+from .base import (
+    ModelBase,
+    ClassificationModel,
+    RegressionModel,
+    TimeSeriesModel,
+    ReinforcementLearningModel,
+    EnsembleModel,
+    Signal,
+    GPTAnalysisModel
+)
 
-# 모델 임포트
-from models.base import ModelBase, ClassificationModel
-from models.gru import GRUPriceModel, GRUDirectionModel
-from models.random_forest import RandomForestDirectionModel
-from models.ensemble import VotingEnsemble
+from .signal import (
+    TradingSignal,
+    standardize_signal,
+    ModelOutput,
+    standardize_model_output
+)
 
+# Add legacy support for Signal to TradingSignal conversions
+def legacy_signal_to_trading_signal(signal: Signal) -> TradingSignal:
+    """Convert legacy Signal to new TradingSignal format"""
+    from utils.constants import SignalType
+    
+    return TradingSignal(
+        signal_type=SignalType.standardize(signal.signal_type),
+        confidence=signal.confidence,
+        reason=signal.reason,
+        metadata=signal.metadata.copy() if signal.metadata else {},
+        timestamp=signal.timestamp
+    )
+    
+# Export common symbols
 __all__ = [
     'ModelBase',
     'ClassificationModel',
-    'GRUPriceModel',
-    'GRUDirectionModel', 
-    'RandomForestDirectionModel',
-    'VotingEnsemble',
-    'get_available_models'
-]
-
-def get_available_models() -> Dict[str, Type[ModelBase]]:
-    """
-    사용 가능한 모든 모델의 딕셔너리 반환
-    
-    Returns:
-        Dict[str, Type[ModelBase]]: 모델 이름과 클래스 딕셔너리
-    """
-    return {
-        'RandomForestDirectionModel': RandomForestDirectionModel,
-        'GRUDirectionModel': GRUDirectionModel,
-        'GRUPriceModel': GRUPriceModel,
-        'VotingEnsemble': VotingEnsemble
-    } 
+    'RegressionModel',
+    'TimeSeriesModel',
+    'ReinforcementLearningModel',
+    'EnsembleModel',
+    'Signal',
+    'TradingSignal',
+    'standardize_signal',
+    'ModelOutput',
+    'standardize_model_output',
+    'legacy_signal_to_trading_signal',
+    'GPTAnalysisModel'
+] 

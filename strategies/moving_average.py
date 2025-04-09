@@ -6,7 +6,7 @@ This module implements a moving average crossover strategy.
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 
 from strategies.base import BaseStrategy
 from utils.logging import get_logger, log_execution
@@ -194,16 +194,30 @@ class MovingAverageCrossover(BaseStrategy):
         return strength
     
     @log_execution
-    def generate_signal(self, data: pd.DataFrame) -> Dict[str, Any]:
+    def generate_signal(self, data: Union[pd.DataFrame, Dict[str, pd.DataFrame]]) -> Dict[str, Any]:
         """
         Generate trading signal based on moving average crossover
         
         Args:
-            data (pd.DataFrame): Market data with OHLCV
+            data (Union[pd.DataFrame, Dict[str, pd.DataFrame]]): Market data with OHLCV,
+                either a single DataFrame or a dictionary of DataFrames
             
         Returns:
             Dict[str, Any]: Signal dictionary
         """
+        # 데이터 전처리: DataFrame이나 Dict 모두 처리 가능하도록
+        if isinstance(data, dict):
+            # 딕셔너리에서 첫 번째 데이터프레임 사용
+            # 일봉 데이터가 있으면 우선 사용
+            if 'daily' in data:
+                data_df = data['daily']
+            else:
+                # 첫 번째 사용 가능한 데이터프레임 사용
+                data_df = next(iter(data.values()))
+        else:
+            # 단일 데이터프레임인 경우 그대로 사용
+            data_df = data
+            
         # Default signal is HOLD
         signal = {
             'signal': 'HOLD',
@@ -214,12 +228,12 @@ class MovingAverageCrossover(BaseStrategy):
         }
         
         # Not enough data
-        if len(data) < self.parameters['slow_period']:
+        if len(data_df) < self.parameters['slow_period']:
             signal['reason'] = f"Insufficient data (need {self.parameters['slow_period']} points)"
             return signal
         
         # Calculate moving averages
-        fast_ma, slow_ma = self._calculate_moving_averages(data)
+        fast_ma, slow_ma = self._calculate_moving_averages(data_df)
         
         # Add to metadata
         signal['metadata']['fast_ma'] = fast_ma.iloc[-1] if not fast_ma.empty else None

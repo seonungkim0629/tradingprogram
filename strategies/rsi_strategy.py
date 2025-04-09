@@ -192,16 +192,30 @@ class RSIStrategy(BaseStrategy):
         return {'signal': 'HOLD', 'reason': f'No RSI signal triggered (current: {current_rsi:.2f})', 'confidence': 0.5}
     
     @log_execution
-    def generate_signal(self, data: pd.DataFrame) -> Dict[str, Any]:
+    def generate_signal(self, data: Union[pd.DataFrame, Dict[str, pd.DataFrame]]) -> Dict[str, Any]:
         """
         Generate trading signal based on RSI values
         
         Args:
-            data (pd.DataFrame): Market data with OHLCV
+            data (Union[pd.DataFrame, Dict[str, pd.DataFrame]]): Market data with OHLCV,
+                either a single DataFrame or a dictionary of DataFrames
             
         Returns:
             Dict[str, Any]: Signal dictionary
         """
+        # 데이터 전처리: DataFrame이나 Dict 모두 처리 가능하도록
+        if isinstance(data, dict):
+            # 딕셔너리에서 첫 번째 데이터프레임 사용
+            # 일봉 데이터가 있으면 우선 사용
+            if 'daily' in data:
+                data_df = data['daily']
+            else:
+                # 첫 번째 사용 가능한 데이터프레임 사용
+                data_df = next(iter(data.values()))
+        else:
+            # 단일 데이터프레임인 경우 그대로 사용
+            data_df = data
+            
         # Default signal is HOLD
         signal = {
             'signal': 'HOLD',
@@ -212,12 +226,12 @@ class RSIStrategy(BaseStrategy):
         }
         
         # Not enough data
-        if len(data) < self.parameters['rsi_period'] + self.parameters['confirmation_period']:
+        if len(data_df) < self.parameters['rsi_period'] + self.parameters['confirmation_period']:
             signal['reason'] = f"Insufficient data (need {self.parameters['rsi_period'] + self.parameters['confirmation_period']} points)"
             return signal
         
         # Calculate RSI
-        rsi_values = self._calculate_rsi(data)
+        rsi_values = self._calculate_rsi(data_df)
         
         # Add to metadata
         if not rsi_values.empty:

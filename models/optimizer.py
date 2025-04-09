@@ -25,12 +25,12 @@ except ImportError:
 
 from config import settings
 from utils.logging import get_logger, log_execution
-from backtest.engine import BacktestEngine
+# 순환 참조 방지를 위해 BacktestEngine 임포트 제거
 from strategies.base import BaseStrategy
 import strategies
 from utils.evaluation import format_backtest_results
 from data.storage import save_backtest_results
-from models.gru import GRUPriceModel, GRUDirectionModel
+from models.gru import GRUPriceModel
 from models.random_forest import RandomForestDirectionModel
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
@@ -70,6 +70,9 @@ def run_optimization(
     Returns:
         Dict[str, Any]: Optimization results
     """
+    # 순환 참조 방지를 위한 함수 내부 임포트
+    from backtest.engine import BacktestEngine
+    
     logger.info(f"Running parameter optimization for {strategy} on {market} from {start_date} to {end_date}")
     
     # Convert string dates to datetime
@@ -306,240 +309,7 @@ def optimize_gru_price_model(
             'best_val_rmse': float('inf')
         }
 
-@log_execution
-def optimize_lstm_direction_model(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    input_shape: Tuple[int, int],
-    n_trials: int = 50,
-    timeout: Optional[int] = None,
-    study_name: str = "lstm_direction_optimization",
-    use_smote: bool = True,
-) -> Dict[str, Any]:
-    """
-    Bayesian optimization for GRU direction prediction model using Optuna
-    (함수 이름은 호환성을 위해 'lstm'을 유지하지만 실제로는 GRU+LayerNormalization 모델을 최적화합니다)
-    
-    Args:
-        X_train: Training data features
-        y_train: Training data targets
-        X_val: Validation data features
-        y_val: Validation data targets
-        input_shape: Model input shape (sequence_length, features)
-        n_trials: Number of optimization trials
-        timeout: Timeout in seconds (optional)
-        study_name: Name for the optimization study
-        use_smote: Whether to use SMOTE for class balancing (default: True)
-        
-    Returns:
-        Dict containing best parameters and optimization results
-    """
-    logger.info(f"Starting Bayesian optimization for GRU+LayerNormalization Direction model with {n_trials} trials")
-    
-    def objective(trial):
-        # Define hyperparameter search space (GRU 모델에 최적화된 범위로 조정)
-        params = {
-            'units': [
-                trial.suggest_int('units_l1', 32, 128),  # 범위 축소: 32-256 → 32-128
-                trial.suggest_int('units_l2', 16, 64),   # 범위 축소: 16-128 → 16-64
-            ],
-            'dropout_rate': trial.suggest_float('dropout_rate', 0.35, 0.5),  # 범위 상향: 0.3-0.5 → 0.35-0.5
-            'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.005, log=True),
-            'batch_size': trial.suggest_categorical('batch_size', [16, 32, 64]),  # 128 제거, 작은 배치가 더 효과적
-            'sequence_length': trial.suggest_int('sequence_length', 30, 60)  # 범위 축소: 30-90 → 30-60
-        }
-        
-        # Create and train the model (LSTMDirectionModel 클래스는 내부적으로 GRU 구현)
-        model = LSTMDirectionModel(
-            units=params['units'],
-            dropout_rate=params['dropout_rate'],
-            learning_rate=params['learning_rate'],
-            batch_size=params['batch_size'],
-            sequence_length=params['sequence_length'],
-            epochs=100  # Use a fixed number of epochs with early stopping
-        )
 
-        # 외부 스코프에서 데이터 복사 (로컬 변수로 사용하기 위함)
-        # 이렇게 하면 외부에서 y_train과 y_val이 변경되어도 안전하게 참조 가능
-        local_X_train = X_train.copy() 
-        local_y_train = y_train.copy()
-        local_X_val = X_val.copy() if X_val is not None else None
-        local_y_val = y_val.copy() if y_val is not None else None
-        
-        # 모델 입력 형태 계산 및 모델 빌드
-        if len(local_X_train.shape) == 3:
-            input_shape = (local_X_train.shape[1], local_X_train.shape[2])  # (sequence_length, features)
-            model.build_model(input_shape)
-        else:
-            logger.error(f"GRU 모델에 맞지 않는 입력 형태: {local_X_train.shape}")
-            return 0  # 실패 시 0 반환 (최대화 목표인 경우 최악의 점수)
-            
-        # 방향성 예측을 위한 타겟 데이터 처리
-        binary_targets = False
-        y_train_binary = None
-        y_val_binary = None
-        
-        # 타겟 데이터가 0/1 이진 클래스가 아닌 실제 가격일 경우 처리
-        if len(local_y_train.shape) == 1 or local_y_train.shape[1] == 1:
-            logger.info(f"y_train 값 범위: 최소={np.min(local_y_train)} 최대={np.max(local_y_train)}")
-            
-            # 고가격 데이터인 경우 (이진 0/1 값이 아님)
-            if np.max(local_y_train) > 1 or np.min(local_y_train) < 0:
-                logger.warning("y_train에 0과 1 이외의 값이 있습니다. 이진 클래스로 변환합니다.")
-                # 모든 값을 일단 1(상승)으로 설정하는 잘못된 방식 대신
-                # 실제 가격 변화에 따른 방향성(상승/하락)을 계산
-                y_train_binary = (np.diff(local_y_train.flatten(), prepend=local_y_train.flatten()[0]) > 0).astype(int)
-                if local_y_val is not None:
-                    y_val_binary = (np.diff(local_y_val.flatten(), prepend=local_y_val.flatten()[0]) > 0).astype(int)
-                binary_targets = True
-                logger.info(f"가격 데이터를 방향성으로 변환: 상승={np.sum(y_train_binary)}, 하락={len(y_train_binary) - np.sum(y_train_binary)}")
-            else:
-                # 이미 0/1 이진 값이면 그대로 사용
-                y_train_binary = local_y_train.astype(np.int32)
-                if local_y_val is not None:
-                    y_val_binary = local_y_val.astype(np.int32)
-                binary_targets = True
-        
-        # 클래스 가중치 계산 (이진 분류의 경우)
-        class_weights = None
-        if binary_targets:
-            # 1차원 배열로 변환
-            if len(y_train_binary.shape) == 2:
-                y_train_binary = y_train_binary.reshape(-1)
-            
-            # 클래스별 샘플 수 계산
-            unique_classes, class_counts = np.unique(y_train_binary, return_counts=True)
-            n_samples = len(y_train_binary)
-            n_classes = 2  # 이진 분류이므로 2개의 클래스(0과 1)가 있어야 함
-            
-            # 클래스 불균형이 심한지 확인
-            is_imbalanced = False
-            if len(unique_classes) == 2:
-                ratio = min(class_counts) / max(class_counts)
-                is_imbalanced = ratio < 0.4  # 클래스 비율이 40% 미만이면 불균형으로 간주
-                logger.info(f"클래스 비율: {ratio:.2f}, 불균형 여부: {is_imbalanced}")
-            
-            # SMOTE를 사용하여 클래스 균형 맞추기
-            if is_imbalanced and use_smote and SMOTE_AVAILABLE and len(unique_classes) > 1:
-                try:
-                    logger.info("SMOTE를 사용하여 클래스 불균형 처리를 시작합니다.")
-                    # 2D 형태로 변환 (SMOTE는 2D 배열 필요)
-                    if len(local_X_train.shape) == 3:
-                        # 3D 데이터를 2D로 변환
-                        seq_len, n_features = local_X_train.shape[1], local_X_train.shape[2]
-                        reshaped_X = local_X_train.reshape(local_X_train.shape[0], -1)
-                        
-                        # SMOTE 적용
-                        sm = SMOTE(random_state=42)
-                        reshaped_X_balanced, y_train_binary = sm.fit_resample(reshaped_X, y_train_binary)
-                        
-                        # 다시 3D로 변환
-                        n_samples_new = reshaped_X_balanced.shape[0]
-                        local_X_train = reshaped_X_balanced.reshape(n_samples_new, seq_len, n_features)
-                        
-                        # 새로운 클래스 분포 확인
-                        new_unique, new_counts = np.unique(y_train_binary, return_counts=True)
-                        logger.info(f"SMOTE 적용 후 클래스 분포: {dict(zip(new_unique, new_counts))}")
-                    else:
-                        # 이미 2D 형태인 경우
-                        sm = SMOTE(random_state=42)
-                        local_X_train, y_train_binary = sm.fit_resample(local_X_train, y_train_binary)
-                        
-                        # 새로운 클래스 분포 확인
-                        new_unique, new_counts = np.unique(y_train_binary, return_counts=True)
-                        logger.info(f"SMOTE 적용 후 클래스 분포: {dict(zip(new_unique, new_counts))}")
-                
-                except Exception as e:
-                    logger.error(f"SMOTE 적용 중 오류 발생: {str(e)}")
-                    logger.warning("클래스 가중치를 사용하여 불균형을 처리합니다.")
-                    
-                    # 가중치 계산으로 대체
-                    if len(unique_classes) < 2:
-                        logger.warning(f"한 종류의 클래스만 발견됨: {unique_classes}. 인공적으로 균형 있는 클래스 가중치 생성.")
-                        class_weights = {0: 1.0, 1: 1.0}
-                        
-                        for cls, count in zip(unique_classes, class_counts):
-                            class_weights[int(cls)] = float(n_samples / (n_classes * count))
-                    else:
-                        class_weights = {
-                            int(cls): float(n_samples / (n_classes * count))
-                            for cls, count in zip(unique_classes, class_counts)
-                        }
-            else:
-                # SMOTE를 사용하지 않는 경우, 기존 클래스 가중치 계산 로직 사용
-                if len(unique_classes) < 2:
-                    logger.warning(f"한 종류의 클래스만 발견됨: {unique_classes}. 인공적으로 균형 있는 클래스 가중치 생성.")
-                    class_weights = {0: 1.0, 1: 1.0}
-                    
-                    for cls, count in zip(unique_classes, class_counts):
-                        class_weights[int(cls)] = float(n_samples / (n_classes * count))
-                else:
-                    class_weights = {
-                        int(cls): float(n_samples / (n_classes * count))
-                        for cls, count in zip(unique_classes, class_counts)
-                    }
-            
-            logger.info(f"클래스 분포: {dict(zip(unique_classes, class_counts))}")
-            if class_weights:
-                logger.info(f"계산된 클래스 가중치: {class_weights}")
-        
-        # Train with early stopping
-        training_history = model.train(
-            local_X_train, 
-            y_train_binary if binary_targets else local_y_train, 
-            local_X_val,
-            y_val_binary if binary_targets else local_y_val,
-            class_weights=class_weights,
-            early_stopping_patience=10,
-            reduce_lr_patience=5
-        )
-        
-        # Return validation accuracy (higher is better, negate for minimization)
-        val_accuracy = training_history.get('val_accuracy', 0)
-        
-        # 실제 검증 정확도 사용
-        return -val_accuracy
-    
-    # Create Optuna study
-    study = optuna.create_study(
-        study_name=study_name,
-        direction="minimize",  # Minimize validation accuracy
-        sampler=optuna.samplers.TPESampler(seed=42)  # Use TPE algorithm with fixed seed
-    )
-    
-    # Run optimization
-    study.optimize(objective, n_trials=n_trials, timeout=timeout)
-    
-    # Get best parameters and results
-    best_params = study.best_params
-    best_value = -study.best_value  # Convert back to accuracy
-    
-    # Create complete parameter dict from best params
-    best_model_params = {
-        'units': [
-            best_params['units_l1'],
-            best_params['units_l2'],
-        ],
-        'dropout_rate': best_params['dropout_rate'],
-        'learning_rate': best_params['learning_rate'],
-        'batch_size': best_params['batch_size'],
-        'sequence_length': best_params['sequence_length'],
-    }
-    
-    # Log best parameters
-    logger.info(f"GRU+LayerNormalization 모델 최적화 완료. 최적 검증 정확도: {best_value:.6f}")
-    logger.info(f"최적 파라미터: {best_model_params}")
-    
-    # Return optimization results
-    return {
-        'best_params': best_model_params,
-        'best_val_accuracy': best_value,
-        'best_val_f1': best_value,  # F1 점수는 현재 없어서 정확도를 대신 사용
-        'n_trials': n_trials,
-        'study': study
-    }
 
 @log_execution
 def optimize_rf_direction_model(

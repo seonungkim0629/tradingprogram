@@ -17,10 +17,27 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(BASE_DIR, 'config')
 DATA_DIR = os.path.join(BASE_DIR, 'data_storage')
 LOG_DIR = os.path.join(BASE_DIR, 'logs')
+MODELS_DIR = os.path.join(BASE_DIR, 'saved_models')
+
+# 데이터 관련 하위 디렉토리 - 일관성 있는 경로 관리를 위해 추가
+OHLCV_DIR = os.path.join(DATA_DIR, 'ohlcv')
+INDICATORS_DIR = os.path.join(DATA_DIR, 'indicators')
+FEATURES_DIR = os.path.join(DATA_DIR, 'features')
+RESULTS_DIR = os.path.join(DATA_DIR, 'results')
+COMBINED_DIR = os.path.join(DATA_DIR, 'combined')
+STACKED_DIR = os.path.join(DATA_DIR, 'stacked')
+RAW_DIR = os.path.join(DATA_DIR, 'raw')
+STATE_DIR = os.path.join(DATA_DIR, 'state')
+
+# 모델 관련 하위 디렉토리
+MODEL_CHECKPOINTS_DIR = os.path.join(MODELS_DIR, 'checkpoints')
+MODEL_EVALUATION_DIR = os.path.join(MODELS_DIR, 'evaluation')
 
 # Create necessary directories
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
+for directory in [DATA_DIR, LOG_DIR, MODELS_DIR, OHLCV_DIR, INDICATORS_DIR, 
+                 FEATURES_DIR, RESULTS_DIR, COMBINED_DIR, STACKED_DIR, RAW_DIR, 
+                 STATE_DIR, MODEL_CHECKPOINTS_DIR, MODEL_EVALUATION_DIR]:
+    os.makedirs(directory, exist_ok=True)
 
 # API Keys - Load from environment variables or .env file
 try:
@@ -37,7 +54,9 @@ DEFAULT_MARKET = "KRW-BTC"
 
 # Trading Settings
 TRADING_AMOUNT = float(os.environ.get('TRADING_AMOUNT', 10000000))  # 기본 거래 금액 (KRW)
-TRADING_FEE = 0.0005  # 거래 수수료 (0.05%)
+FEE = 0.0005  # 거래 수수료 (0.05%)
+TRADING_FEE = FEE  # 하위 호환성 유지
+SLIPPAGE = 0.0002  # 슬리피지 (0.02%)
 
 # Risk Management
 MAX_TRADES_PER_DAY = 5
@@ -50,8 +69,37 @@ TRAILING_STOP_PERCENTAGE = 0.008  # 트레일링 스탑 비율 (0.8%)
 from datetime import datetime, timedelta
 BACKTEST_START_DATE = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
 BACKTEST_END_DATE = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-BACKTEST_COMMISSION = 0.0005  # 수수료
-BACKTEST_SLIPPAGE = 0.0002  # 슬리피지
+BACKTEST_COMMISSION = FEE  # BACKTEST_COMMISSION도 FEE로 통일하고 호환성 위해 유지
+BACKTEST_SLIPPAGE = SLIPPAGE  # 슬리피지
+
+# 데이터 관리 설정
+DATA_MAX_CANDLES = {
+    'day': 1000,
+    'hour': 500,
+    'minute5': 1000,
+    'minute1': 500
+}
+
+DATA_UPDATE_INTERVALS = {
+    'day': 86400,    # 24시간
+    'hour': 3600,    # 1시간
+    'minute5': 900,  # 15분
+    'minute1': 300   # 5분
+}
+
+DATA_INITIAL_COUNTS = {
+    'day': 100,
+    'hour': 168,  # 1주일
+    'minute5': 1000,
+    'minute1': 500
+}
+
+DATA_UPDATE_COUNTS = {
+    'day': 5,
+    'hour': 24,
+    'minute5': 100,
+    'minute1': 100
+}
 
 # Model Settings
 MODEL_VERSION = "1.0.0"

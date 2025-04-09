@@ -20,20 +20,16 @@ from utils.logging import get_logger, log_execution
 # Initialize logger
 logger = get_logger(__name__)
 
-# Ensure data directory exists
-os.makedirs(settings.DATA_DIR, exist_ok=True)
-
-# Define subdirectories
-OHLCV_DIR = os.path.join(settings.DATA_DIR, 'ohlcv')
-INDICATORS_DIR = os.path.join(settings.DATA_DIR, 'indicators')
-MODELS_DIR = os.path.join(settings.DATA_DIR, 'models')
-RESULTS_DIR = os.path.join(settings.DATA_DIR, 'results')
-
-# Create subdirectories
-os.makedirs(OHLCV_DIR, exist_ok=True)
-os.makedirs(INDICATORS_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
+# 경로 상수를 settings 모듈에서 가져옴 - 중복 코드 제거
+OHLCV_DIR = settings.OHLCV_DIR
+INDICATORS_DIR = settings.INDICATORS_DIR
+RESULTS_DIR = settings.RESULTS_DIR
+DATA_DIR = settings.DATA_DIR
+MODELS_DIR = settings.MODELS_DIR
+FEATURES_DIR = settings.FEATURES_DIR
+COMBINED_DIR = settings.COMBINED_DIR
+STACKED_DIR = settings.STACKED_DIR
+RAW_DIR = settings.RAW_DIR
 
 
 @log_execution
@@ -185,9 +181,8 @@ def stack_hourly_data(ticker: str, new_data: pd.DataFrame, max_records: int = 20
     Returns:
         str: Path to the file where data was saved
     """
-    # Create directory if needed
-    
-    hourly_dir = os.path.join(settings.DATA_DIR, 'hourly', ticker)
+    # 설정 모듈의 경로 사용
+    hourly_dir = os.path.join(STACKED_DIR, ticker)
     os.makedirs(hourly_dir, exist_ok=True)
     
     # List existing hourly files for this ticker
@@ -225,6 +220,7 @@ def stack_hourly_data(ticker: str, new_data: pd.DataFrame, max_records: int = 20
         filepath = latest_file
     
     return filepath
+
 @log_execution
 def save_json(data: Dict[str, Any], filename: str, directory: str = RESULTS_DIR) -> str:
     """
@@ -374,8 +370,15 @@ def save_processed_data(df: pd.DataFrame, ticker: str, data_type: str, timeframe
     Returns:
         str: Path to saved file
     """
+    # 데이터 유형에 따른 디렉토리 결정
+    if data_type == 'indicators':
+        directory = INDICATORS_DIR
+    elif data_type == 'features':
+        directory = FEATURES_DIR
+    else:
+        directory = os.path.join(DATA_DIR, data_type)
+    
     # Create directory if needed
-    directory = os.path.join(settings.DATA_DIR, data_type)
     os.makedirs(directory, exist_ok=True)
     
     # Create standardized filename
@@ -397,67 +400,133 @@ def save_model(model: Any, model_name: str, model_type: str, ticker: str = None)
         ticker (str, optional): Ticker symbol. Defaults to None.
         
     Returns:
-        str: Path to saved model
+        str: Path to saved file
     """
-    # Create directory for this model type
-    model_dir = os.path.join(MODELS_DIR, model_type)
-    os.makedirs(model_dir, exist_ok=True)
+    # 모델 디렉토리 사용
+    model_dir = settings.MODELS_DIR
     
-    # Create filename
+    # Create filename with metadata
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if ticker:
-        filename = f"{model_name}_{ticker}_{timestamp}.pkl"
-    else:
-        filename = f"{model_name}_{timestamp}.pkl"
+    ticker_str = f"{ticker}_" if ticker else ""
+    filename = f"{ticker_str}{model_type}_{model_name}_{timestamp}.pkl"
     
     return save_dataframe_to_pickle(model, filename, model_dir)
 
 
 @log_execution
-def load_model(model_name: str, model_type: str, ticker: str = None, timestamp: str = None) -> Optional[Any]:
+def load_model(model_path: str) -> Optional[Any]:
     """
     Load a trained model
     
     Args:
-        model_name (str): Name of the model
-        model_type (str): Type of model (e.g., 'lstm', 'random_forest', 'reinforcement')
-        ticker (str, optional): Ticker symbol. Defaults to None.
-        timestamp (str, optional): Timestamp of the model to load. If None, loads the latest. Defaults to None.
+        model_path (str): Path to the model file
         
     Returns:
         Optional[Any]: Loaded model or None if error
     """
-    # Create directory path
-    model_dir = os.path.join(MODELS_DIR, model_type)
-    
-    # Get matching model files
-    if ticker:
-        pattern = f"{model_name}_{ticker}_"
-    else:
-        pattern = f"{model_name}_"
-    
-    # Check if directory exists
-    if not os.path.exists(model_dir):
-        logger.warning(f"Model directory not found: {model_dir}")
+    try:
+        if not os.path.exists(model_path):
+            # Check if it's a relative path within the models directory
+            absolute_path = os.path.join(settings.MODELS_DIR, model_path)
+            if not os.path.exists(absolute_path):
+                logger.warning(f"Model file not found: {model_path}")
+                return None
+            model_path = absolute_path
+            
+        # Load the model
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+            
+        logger.info(f"Loaded model from {model_path}")
+        return model
+    except Exception as e:
+        logger.error(f"Error loading model from {model_path}: {str(e)}")
         return None
+
+
+@log_execution
+def save_combined_dataset(combined_data: Dict[str, pd.DataFrame], ticker: str) -> str:
+    """
+    여러 타임프레임의 데이터를 통합하여 저장
     
-    matching_files = [f for f in os.listdir(model_dir) if f.startswith(pattern) and f.endswith('.pkl')]
+    Args:
+        combined_data (Dict[str, pd.DataFrame]): 타임프레임별 데이터프레임 딕셔너리
+        ticker (str): 티커 심볼
+        
+    Returns:
+        str: 저장된 파일 경로
+    """
+    # 통합 데이터 디렉토리 사용
+    combined_dir = COMBINED_DIR
+    os.makedirs(combined_dir, exist_ok=True)
+    
+    # 파일명 생성
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    filename = f"{ticker}_combined_{timestamp}.pkl"
+    filepath = os.path.join(combined_dir, filename)
+    
+    try:
+        # 파일 저장
+        with open(filepath, 'wb') as f:
+            pickle.dump(combined_data, f)
+            
+        # 오래된 파일 정리 (최신 5개만 유지)
+        existing_files = [f for f in os.listdir(combined_dir) 
+                          if f.startswith(f"{ticker}_combined_") and f.endswith('.pkl')]
+        if len(existing_files) > 5:
+            existing_files.sort()
+            for old_file in existing_files[:-5]:
+                try:
+                    os.remove(os.path.join(combined_dir, old_file))
+                    logger.debug(f"Removed old combined dataset: {old_file}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove old file {old_file}: {str(e)}")
+                    
+        logger.info(f"Saved combined dataset to {filepath}")
+        return filepath
+    except Exception as e:
+        logger.error(f"Error saving combined dataset: {str(e)}")
+        return ""
+
+
+@log_execution
+def load_latest_combined_dataset(ticker: str) -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    최신 통합 데이터셋 로드
+    
+    Args:
+        ticker (str): 티커 심볼
+        
+    Returns:
+        Optional[Dict[str, pd.DataFrame]]: 타임프레임별 데이터프레임 딕셔너리 또는 None
+    """
+    combined_dir = COMBINED_DIR
+    if not os.path.exists(combined_dir):
+        logger.warning(f"Combined data directory does not exist: {combined_dir}")
+        return None
+        
+    # 해당 티커의 통합 데이터 파일 찾기
+    pattern = f"{ticker}_combined_"
+    matching_files = [f for f in os.listdir(combined_dir) 
+                      if f.startswith(pattern) and f.endswith('.pkl')]
     
     if not matching_files:
-        logger.warning(f"No matching models found for {model_name}")
+        logger.warning(f"No combined dataset found for {ticker}")
         return None
+        
+    # 날짜별 정렬하여 최신 파일 가져오기
+    matching_files.sort(reverse=True)
+    latest_file = os.path.join(combined_dir, matching_files[0])
     
-    # Load specific model by timestamp or latest
-    if timestamp:
-        target_file = next((f for f in matching_files if timestamp in f), None)
-        if not target_file:
-            logger.warning(f"No model found with timestamp {timestamp}")
-            return None
-    else:
-        # Sort by timestamp to get the latest
-        target_file = sorted(matching_files)[-1]
-    
-    return load_dataframe_from_pickle(target_file, model_dir)
+    try:
+        with open(latest_file, 'rb') as f:
+            combined_data = pickle.load(f)
+            
+        logger.info(f"Loaded latest combined dataset from {latest_file}")
+        return combined_data
+    except Exception as e:
+        logger.error(f"Error loading combined dataset from {latest_file}: {str(e)}")
+        return None
 
 
 @log_execution

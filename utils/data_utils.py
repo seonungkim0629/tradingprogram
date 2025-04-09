@@ -10,6 +10,12 @@ import pandas as pd
 from typing import Tuple, List, Dict, Any, Optional, Union
 from datetime import datetime, timedelta
 import logging
+import requests
+import json
+from time import sleep
+import os
+
+from config import settings
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -291,3 +297,249 @@ def ensure_feature_consistency(data_dict, feature_axis=2, common_strategy='inter
     else:
         logger.warning(f"알 수 없는 특성 조정 전략: {common_strategy}, 원본 데이터셋 반환")
         return data_dict 
+
+def get_fear_greed_index() -> Dict[str, Any]:
+    """
+    Alternative.me의 Fear & Greed Index API에서 현재 공포탐욕지수를 가져옵니다.
+    
+    Returns:
+        Dict[str, Any]: 공포탐욕지수 정보를 담은 사전
+            {
+                'value': (int) 공포탐욕지수 값 (0-100),
+                'value_classification': (str) 지수 분류,
+                'timestamp': (str) 타임스탬프,
+                'time_until_update': (str) 다음 업데이트까지 남은 시간
+            }
+    """
+    # API URL
+    url = "https://api.alternative.me/fng/"
+    
+    try:
+        # API 요청
+        response = requests.get(url, timeout=10)
+        
+        # 응답 확인
+        if response.status_code == 200:
+            data = response.json()
+            
+            # 데이터 형식 확인
+            if 'data' in data and len(data['data']) > 0:
+                latest_data = data['data'][0]
+                
+                # 필요한 정보 추출
+                result = {
+                    'value': int(latest_data.get('value', 50)),  # 값이 없으면 중립값(50) 반환
+                    'value_classification': latest_data.get('value_classification', 'Neutral'),
+                    'timestamp': latest_data.get('timestamp', ''),
+                    'time_until_update': latest_data.get('time_until_update', '')
+                }
+                
+                logger.info(f"공포탐욕지수: {result['value']} ({result['value_classification']})")
+                return result
+            else:
+                logger.warning("API 응답에 데이터가 없습니다. 기본값 반환.")
+                return {
+                    'value': 50,  # 중립값 반환
+                    'value_classification': 'Neutral',
+                    'timestamp': '',
+                    'time_until_update': ''
+                }
+        else:
+            logger.error(f"API 요청 실패. 상태 코드: {response.status_code}")
+            return None
+            
+    except requests.RequestException as e:
+        logger.error(f"API 요청 중 오류 발생: {str(e)}")
+        # 네트워크 오류 시 재시도
+        try:
+            logger.info("API 요청 재시도 중...")
+            sleep(2)  # 2초 대기 후 재시도
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and len(data['data']) > 0:
+                    latest_data = data['data'][0]
+                    result = {
+                        'value': int(latest_data.get('value', 50)),
+                        'value_classification': latest_data.get('value_classification', 'Neutral'),
+                        'timestamp': latest_data.get('timestamp', ''),
+                        'time_until_update': latest_data.get('time_until_update', '')
+                    }
+                    logger.info(f"공포탐욕지수 재시도 성공: {result['value']} ({result['value_classification']})")
+                    return result
+            logger.warning("API 재시도 실패. 기본값 반환.")
+        except Exception as retry_error:
+            logger.error(f"API 재시도 중 오류 발생: {str(retry_error)}")
+        
+        # 오류 시 기본값 반환
+        return {
+            'value': 50,  # 중립값 반환
+            'value_classification': 'Neutral',
+            'timestamp': '',
+            'time_until_update': ''
+        }
+    except Exception as e:
+        logger.error(f"알 수 없는 오류 발생: {str(e)}")
+        # 오류 시 기본값 반환
+        return {
+            'value': 50,  # 중립값 반환
+            'value_classification': 'Neutral',
+            'timestamp': '',
+            'time_until_update': ''
+        }
+
+def get_fear_greed_state() -> str:
+    """
+    공포탐욕지수 API에서 시장 상태를 가져옵니다.
+    
+    Returns:
+        str: 시장 상태 ('extreme_fear', 'fear', 'neutral', 'greed', 'extreme_greed')
+    """
+    # 공포탐욕지수 가져오기
+    fgi_data = get_fear_greed_index()
+    
+    if fgi_data is None:
+        logger.warning("공포탐욕지수를 가져오지 못했습니다. 중립 상태를 반환합니다.")
+        return "neutral"
+    
+    # 지수값을 이용해 시장 상태 결정
+    fgi_value = fgi_data['value']
+    
+    if fgi_value < 25:
+        return "extreme_fear"
+    elif fgi_value < 45:
+        return "fear"
+    elif fgi_value < 55:
+        return "neutral"
+    elif fgi_value < 75:
+        return "greed"
+    else:
+        return "extreme_greed"
+
+def clean_dataframe(df: pd.DataFrame, handle_missing: str = 'interpolate') -> pd.DataFrame:
+    """
+    데이터프레임 정리: 결측치 처리, 문자열 열 제거, 중복 제거 등
+    
+    Args:
+        df (pd.DataFrame): 원본 데이터프레임
+        handle_missing (str): 결측치 처리 방법 ('drop', 'interpolate', 'ffill', 'bfill', 'zero')
+        
+    Returns:
+        pd.DataFrame: 정리된 데이터프레임
+    """
+    if df is None or df.empty:
+        logger.warning("데이터프레임이 비어있습니다.")
+        return pd.DataFrame()
+    
+    # 복사본으로 작업
+    clean_df = df.copy()
+    
+    # 중복 인덱스 제거
+    if clean_df.index.duplicated().any():
+        clean_df = clean_df[~clean_df.index.duplicated(keep='last')]
+        logger.info(f"{sum(df.index.duplicated())}개의 중복 인덱스가 제거되었습니다.")
+    
+    # 숫자형 열만 유지
+    numeric_cols = clean_df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) < len(clean_df.columns):
+        logger.info(f"{len(clean_df.columns) - len(numeric_cols)}개의 비숫자형 열이 제거되었습니다.")
+        clean_df = clean_df[numeric_cols]
+    
+    # 결측치 처리
+    if clean_df.isna().any().any():
+        na_count = clean_df.isna().sum().sum()
+        
+        if handle_missing == 'drop':
+            clean_df = clean_df.dropna()
+            logger.info(f"행 삭제로 {na_count}개의 결측치가 처리되었습니다.")
+        elif handle_missing == 'interpolate':
+            clean_df = clean_df.interpolate(method='linear')
+            clean_df = clean_df.fillna(method='ffill').fillna(method='bfill')
+            logger.info(f"보간으로 {na_count}개의 결측치가 처리되었습니다.")
+        elif handle_missing == 'ffill':
+            clean_df = clean_df.fillna(method='ffill')
+            clean_df = clean_df.fillna(method='bfill')  # 시작 부분의 NaN 처리
+            logger.info(f"순방향 채움으로 {na_count}개의 결측치가 처리되었습니다.")
+        elif handle_missing == 'bfill':
+            clean_df = clean_df.fillna(method='bfill')
+            clean_df = clean_df.fillna(method='ffill')  # 끝부분의 NaN 처리
+            logger.info(f"역방향 채움으로 {na_count}개의 결측치가 처리되었습니다.")
+        elif handle_missing == 'zero':
+            clean_df = clean_df.fillna(0)
+            logger.info(f"0 대체로 {na_count}개의 결측치가 처리되었습니다.")
+    
+    # 인덱스가 시간순으로 정렬되었는지 확인
+    if not clean_df.index.is_monotonic_increasing:
+        clean_df = clean_df.sort_index()
+        logger.info("인덱스가 시간순으로 정렬되었습니다.")
+    
+    return clean_df
+
+def load_dataframe_with_cache(filepath: str, cache_dir: str = None, cache_key: str = None,
+                             force_reload: bool = False, **read_kwargs) -> pd.DataFrame:
+    """
+    데이터프레임을 로드하고 캐싱합니다. 동일한 파일을 여러 번 읽을 때 성능 향상을 위한 함수입니다.
+    
+    Args:
+        filepath (str): 로드할 파일 경로 (.csv, .parquet, .pkl 등)
+        cache_dir (str, optional): 캐시 디렉토리. 기본값은 None (캐시 사용 안함).
+        cache_key (str, optional): 캐시 키. 기본값은 None (파일명 사용).
+        force_reload (bool, optional): 캐시를 무시하고 강제로 다시 로드할지 여부. 기본값은 False.
+        **read_kwargs: pd.read_csv, pd.read_parquet 등에 전달할 추가 인자
+    
+    Returns:
+        pd.DataFrame: 로드된 데이터프레임
+    """
+    # 캐시 키가 없으면 파일명에서 생성
+    if cache_key is None:
+        cache_key = os.path.basename(filepath)
+    
+    # 캐시 디렉토리 설정
+    if cache_dir is None:
+        cache_dir = os.path.join(settings.DATA_DIR, '.cache')
+    
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # 캐시 파일 경로
+    cache_path = os.path.join(cache_dir, f"{cache_key}.pkl")
+    
+    # 캐시가 있고 강제 리로드가 아니면 캐시에서 로드
+    if not force_reload and os.path.exists(cache_path):
+        try:
+            df = pd.read_pickle(cache_path)
+            logger.debug(f"캐시에서 데이터 로드: {cache_path}")
+            return df
+        except Exception as e:
+            logger.warning(f"캐시 로드 실패, 원본에서 다시 로드합니다: {str(e)}")
+    
+    # 파일 확장자에 따라 적절한 읽기 함수 선택
+    _, ext = os.path.splitext(filepath.lower())
+    
+    try:
+        if ext == '.csv':
+            df = pd.read_csv(filepath, **read_kwargs)
+        elif ext == '.parquet':
+            df = pd.read_parquet(filepath, **read_kwargs)
+        elif ext in ['.pkl', '.pickle']:
+            df = pd.read_pickle(filepath, **read_kwargs)
+        elif ext == '.feather':
+            df = pd.read_feather(filepath, **read_kwargs)
+        elif ext in ['.xlsx', '.xls']:
+            df = pd.read_excel(filepath, **read_kwargs)
+        elif ext == '.json':
+            df = pd.read_json(filepath, **read_kwargs)
+        else:
+            logger.error(f"지원되지 않는 파일 포맷: {ext}")
+            return pd.DataFrame()
+        
+        # 캐시 저장
+        if cache_dir is not None:
+            df.to_pickle(cache_path)
+            logger.debug(f"데이터 캐시 저장: {cache_path}")
+        
+        return df
+    
+    except Exception as e:
+        logger.error(f"파일 로드 중 오류 발생: {str(e)}")
+        return pd.DataFrame() 

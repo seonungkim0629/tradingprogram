@@ -233,7 +233,7 @@ def log_execution(func: Callable) -> Callable:
                 
             # 실행 시간에 따라 로그 레벨 결정
             if execution_time > 5.0:
-                logger.warning(f"Slow execution of {func_id} in {execution_time:.2f}s")
+                logger.debug(f"Slow execution of {func_id} in {execution_time:.2f}s")
             elif execution_time > 1.0:
                 logger.info(f"Completed {func_id} in {execution_time:.2f}s")
             else:
@@ -270,20 +270,35 @@ def log_trade(trade_type: str, ticker: str, price: float, amount: float,
         total (float): Total value of the trade
         reason (str, optional): Reason for the trade. Defaults to None.
     """
-    trade_logger = get_logger("trading.execution")
-    
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_message = f"[{timestamp}] {trade_type} {ticker}: {amount:.8f} @ {price:,.0f} = {total:,.0f} KRW"
-    
-    if reason:
-        log_message += f" | Reason: {reason}"
-    
-    if trade_type.upper() == 'BUY':
-        trade_logger.info(f"🔵 {log_message}")
-    elif trade_type.upper() == 'SELL':
-        trade_logger.info(f"🔴 {log_message}")
-    else:
-        trade_logger.info(log_message)
+    # 데이터베이스에 저장
+    try:
+        from utils.database import save_trade
+        
+        # 추가 메타데이터 생성 (필요시 확장)
+        metadata = {}
+        if reason:
+            metadata['reason_details'] = reason
+        
+        # 데이터베이스에 저장
+        save_trade(
+            trade_type=trade_type.upper(), 
+            ticker=ticker, 
+            price=price, 
+            amount=amount, 
+            total=total,
+            reason=reason,
+            metadata=metadata
+        )
+    except ImportError:
+        # utils.database를 import할 수 없는 경우, 기존 로깅 방식 사용
+        trade_logger = get_logger("trading.execution")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {trade_type} {ticker}: {amount:.8f} @ {price:,.0f} = {total:,.0f} KRW"
+        
+        if reason:
+            log_message += f" | Reason: {reason}"
+        
+        trade_logger.debug(log_message)  # INFO에서 DEBUG로 변경
 
 
 def log_strategy_signal(strategy_name: str, ticker: str, signal_type: str, 
@@ -298,26 +313,35 @@ def log_strategy_signal(strategy_name: str, ticker: str, signal_type: str,
         confidence (float, optional): Signal confidence (0.0 to 1.0). Defaults to None.
         details (Dict[str, Any], optional): Additional signal details. Defaults to None.
     """
-    strategy_logger = get_logger(f"strategy.{strategy_name}")
-    
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    if confidence is not None:
-        confidence_str = f"{confidence:.2f}"
-        log_message = f"[{timestamp}] {strategy_name} - {signal_type} signal for {ticker} (confidence: {confidence_str})"
-    else:
-        log_message = f"[{timestamp}] {strategy_name} - {signal_type} signal for {ticker}"
-    
-    if details:
-        details_str = " | " + " | ".join([f"{k}: {v}" for k, v in details.items()])
-        log_message += details_str
-    
-    if signal_type.upper() == 'BUY':
-        strategy_logger.info(f"▲ {log_message}")
-    elif signal_type.upper() == 'SELL':
-        strategy_logger.info(f"▼ {log_message}")
-    else:
-        strategy_logger.info(f"■ {log_message}")
+    # 데이터베이스에 저장
+    try:
+        from utils.database import save_signal
+        
+        # 데이터베이스에 저장
+        save_signal(
+            strategy=strategy_name,
+            ticker=ticker,
+            signal_type=signal_type.upper(),
+            confidence=confidence,
+            details=details
+        )
+    except ImportError:
+        # utils.database를 import할 수 없는 경우, 기존 로깅 방식 사용 (DEBUG 레벨로 변경)
+        strategy_logger = get_logger(f"strategy.{strategy_name}")
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if confidence is not None:
+            confidence_str = f"{confidence:.2f}"
+            log_message = f"[{timestamp}] {strategy_name} - {signal_type} signal for {ticker} (confidence: {confidence_str})"
+        else:
+            log_message = f"[{timestamp}] {strategy_name} - {signal_type} signal for {ticker}"
+        
+        if details:
+            details_str = " | " + " | ".join([f"{k}: {v}" for k, v in details.items()])
+            log_message += details_str
+        
+        strategy_logger.debug(log_message)  # INFO에서 DEBUG로 변경
 
 
 def log_portfolio_update(portfolio_value: float, cash: float, holdings: Dict[str, Dict[str, float]], 

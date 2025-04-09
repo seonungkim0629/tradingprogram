@@ -21,7 +21,7 @@ from utils.logging import get_logger, log_execution
 from utils.evaluation import calculate_metrics, perform_statistical_test, calculate_monte_carlo_confidence, analyze_market_correlation
 from strategies.base import BaseStrategy
 from data.collectors import get_historical_data
-from data.indicators import add_indicators
+from data.indicators import calculate_all_indicators
 from data.processors import extend_with_synthetic_data
 
 # Initialize logger
@@ -97,55 +97,96 @@ class BacktestResult:
         with open(filepath, 'w') as f:
             json.dump(self.to_dict(), f, indent=2)
         
-        logger.info(f"Saved backtest results to {filepath}")
+        logger.debug(f"Saved backtest results to {filepath}")
         return filepath
 
 
 class BacktestEngine:
-    """Backtesting engine for evaluating trading strategies"""
+    """
+    백테스팅 엔진 클래스
     
-    def __init__(self, 
-                initial_balance: float = 1000000.0,
-                commission_rate: float = 0.0005,
-                data_frequency: str = 'minute60',
-                slippage: float = 0.0):
+    Arguments:
+        config (Dict[str, Any], optional): 설정 딕셔너리
+    """
+    
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         """
-        Initialize the backtest engine
+        백테스팅 엔진 초기화
         
-        Args:
-            initial_balance (float): Initial balance in KRW
-            commission_rate (float): Trading commission as a decimal
-            data_frequency (str): Data frequency (e.g., minute60, day)
-            slippage (float): Slippage as a decimal
+        Arguments:
+            config (Dict[str, Any], optional): 설정 딕셔너리
         """
-        self.initial_balance = initial_balance
-        self.commission_rate = commission_rate
-        self.data_frequency = data_frequency
-        self.slippage = slippage
-        self.logger = logger
+        self.config = config or {}
         
-        self.logger.info(f"Initialized backtest engine with {initial_balance} KRW, "
-                         f"{commission_rate*100}% commission, {slippage*100}% slippage")
+        # 기본 설정값 설정
+        self.initial_balance = self.config.get('initial_balance', 1000000.0)
+        self.commission_rate = self.config.get('fee', 0.0005)  # 'fee' 설정값을 가져오지만 변수명은 commission_rate로 유지
+        self.slippage = self.config.get('slippage', 0.0)
+        self.strict_mode = self.config.get('strict', False)  # 엄격 모드 설정
+        
+        # 시장 및 기간 설정
+        self.market = self.config.get('market', 'KRW-BTC')
+        self.timeframe = self.config.get('timeframe', 'day')
+        
+        # 기간 설정
+        days = self.config.get('days', 365)
+        self.end_date = datetime.now()
+        self.start_date = self.end_date - timedelta(days=days)
+        
+        # 시작일과 종료일이 명시적으로 제공된 경우 사용
+        if 'start_date' in self.config:
+            try:
+                self.start_date = datetime.strptime(self.config['start_date'], '%Y-%m-%d')
+            except ValueError:
+                self.logger.warning(f"잘못된 시작일 형식: {self.config['start_date']}. 기본값 사용.")
+        
+        if 'end_date' in self.config:
+            try:
+                self.end_date = datetime.strptime(self.config['end_date'], '%Y-%m-%d')
+            except ValueError:
+                self.logger.warning(f"잘못된 종료일 형식: {self.config['end_date']}. 기본값 사용.")
+        
+        # 데이터 수집 설정
+        self.data_source = self.config.get('data_source', 'upbit')
+        
+        # 전략 초기화
+        self.strategy_name = self.config.get('strategy', 'HarmonizingStrategy')
+        
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Initialized backtest engine with {self.config} KRW, {self.commission_rate*100:.2f}% commission, {self.slippage*100:.1f}% slippage")
     
     @log_execution
-    def run(self, strategy: BaseStrategy, 
-            start_date: datetime, 
-            end_date: datetime,
+    def run(self, strategy: Optional[BaseStrategy] = None, 
+            start_date: Optional[datetime] = None, 
+            end_date: Optional[datetime] = None,
             data: Optional[pd.DataFrame] = None,
             use_daily_only: bool = True) -> BacktestResult:
         """
-        Run backtest for a given strategy and time period
+        백테스트 실행
         
-        Args:
-            strategy (BaseStrategy): Trading strategy to test
-            start_date (datetime): Backtest start date
-            end_date (datetime): Backtest end date
-            data (Optional[pd.DataFrame]): Historical data, will be fetched if None
-            use_daily_only (bool): Whether to use only daily data (True) or include hourly data (False)
+        Arguments:
+            strategy (BaseStrategy, optional): 백테스트할 전략 객체
+            start_date (datetime, optional): 백테스트 시작일
+            end_date (datetime, optional): 백테스트 종료일
+            data (pd.DataFrame, optional): 사전 준비된 시장 데이터
+            use_daily_only (bool): 일봉 데이터만 사용할지 여부
             
         Returns:
-            BacktestResult: Backtest results
+            BacktestResult: 백테스트 결과 객체
         """
+        # 파라미터가 제공되지 않은 경우 self의 값 사용
+        start_date = start_date or self.start_date
+        end_date = end_date or self.end_date
+        
+        # 전략이 제공되지 않은 경우 전략 초기화
+        if strategy is None:
+            try:
+                from main import initialize_strategy
+                strategy = initialize_strategy(self.config)
+            except Exception as e:
+                self.logger.error(f"전략 초기화 실패: {str(e)}")
+                raise ValueError(f"전략 초기화 실패: {str(e)}")
+        
         self.logger.info(f"Starting backtest for {strategy.name} from "
                         f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
         
@@ -168,7 +209,7 @@ class BacktestEngine:
             data = data[data.index <= end_date]
             
             # Add indicators
-            data = add_indicators(data)
+            data = calculate_all_indicators(data)
         
         # 데이터가 이미 필터링되어 있어야 하므로 다시 필터링하지 않음
         if len(data) == 0:
@@ -177,9 +218,9 @@ class BacktestEngine:
         
         # Initialize portfolio state
         portfolio = {
-            'cash': self.initial_balance * 0.7,  # 초기 자금의 30%는 이미 포지션에 투자
-            'position': self.initial_balance * 0.3 / data.iloc[0]['close'],  # 초기 자금의 30%를 첫날 가격으로 나눠 초기 포지션 설정
-            'position_value': self.initial_balance * 0.3,  # 초기 포지션 가치
+            'cash': self.initial_balance,  # 전체 자금을 현금으로 시작 (포지션 없음)
+            'position': 0.0,  # 초기 포지션 없음
+            'position_value': 0.0,  # 초기 포지션 가치 없음
             'total_value': self.initial_balance,
             'trades': [],
             'equity_curve': [self.initial_balance],
@@ -210,17 +251,127 @@ class BacktestEngine:
             if processed_days % progress_interval == 0:
                 self.logger.info(f"Backtest progress: {processed_days * 100 // total_days}% ({processed_days}/{total_days} days)")
             
-            # Create market data for signal generation
-            market_data = data.loc[:timestamp].copy()
-            
-            # Generate signal
-            signal = strategy.generate_signal(market_data)
-            
-            # 신호 필터링 로직 추가
-            if portfolio['last_signal'] == signal['signal']:
+            # Fetch data up to this timestamp (Sliding Window)
+            current_data_slice = data.loc[:timestamp]
+
+            # --- 수정 시작 ---
+            # TradingEnsemble이 사용하는 특성만 선택
+            if hasattr(strategy, 'expected_features') and strategy.expected_features:
+                # 마지막 행만 예측에 사용하고, 예상 특성만 선택
+                try:
+                    expected_features = getattr(strategy, 'expected_features', None)
+                    if not expected_features:
+                         self.logger.warning("전략 객체에 expected_features 속성이 없거나 비어 있습니다. 모든 특성을 사용합니다.")
+                         # 중복 컬럼 제거는 수행
+                         slice_for_pred = current_data_slice.iloc[-1:]
+                         duplicates = slice_for_pred.columns[slice_for_pred.columns.duplicated()].tolist()
+                         if duplicates:
+                             self.logger.warning(f"원본 데이터 슬라이스에서 중복 컬럼 발견: {duplicates}. 첫 번째 항목만 유지합니다.")
+                             features_for_prediction = slice_for_pred.loc[:, ~slice_for_pred.columns.duplicated()]
+                         else:
+                             features_for_prediction = slice_for_pred
+                         
+                    else:
+                         # 1. 예상 특성 목록 정리 (중복 제거)
+                         unique_expected_features = pd.Index(expected_features).drop_duplicates().tolist()
+                         
+                         # 2. 현재 데이터 슬라이스 준비 (마지막 행) 및 중복 제거
+                         slice_for_pred = current_data_slice.iloc[-1:]
+                         duplicates_in_slice = slice_for_pred.columns[slice_for_pred.columns.duplicated()].tolist()
+                         if duplicates_in_slice:
+                             self.logger.warning(f"원본 데이터 슬라이스(인덱스: {timestamp})에서 중복 컬럼 발견: {duplicates_in_slice}. 첫 번째 항목만 유지합니다.")
+                             slice_no_duplicates = slice_for_pred.loc[:, ~slice_for_pred.columns.duplicated()]
+                         else:
+                             slice_no_duplicates = slice_for_pred
+                         
+                         actual_columns = slice_no_duplicates.columns.tolist()
+                         
+                         # 3. 예상 특성과 실제 특성 비교 및 로깅
+                         set_expected = set(unique_expected_features)
+                         set_actual = set(actual_columns)
+                         
+                         missing_expected = list(set_expected - set_actual)
+                         extra_actual = list(set_actual - set_expected)
+                         
+                         if missing_expected:
+                             self.logger.warning(f"데이터 슬라이스에 예상된 특성 중 일부가 누락됨: {missing_expected}")
+                         if extra_actual:
+                             # 너무 많은 예상 외 컬럼은 로그 길이를 위해 일부만 표시
+                             log_extra = extra_actual[:10] + ['...'] if len(extra_actual) > 10 else extra_actual
+                             self.logger.warning(f"데이터 슬라이스에 예상치 못한 특성이 포함됨: {log_extra}")
+                             
+                         # 4. 필요한 특성만 선택 (unique_expected_features에 있는 것만)
+                         # slice_no_duplicates에서 unique_expected_features에 있는 컬럼만 선택
+                         cols_to_select = [col for col in unique_expected_features if col in actual_columns]
+                         if not cols_to_select:
+                              self.logger.error("예상된 특성 중 사용 가능한 컬럼이 하나도 없습니다!")
+                              features_selected = pd.DataFrame(columns=unique_expected_features, index=slice_no_duplicates.index) # 빈 DF 생성
+                         else:
+                              features_selected = slice_no_duplicates[cols_to_select]
+                         
+                         # 5. 최종 reindex (순서 맞추고, 누락된 예상 컬럼은 0으로 채움)
+                         features_for_prediction = features_selected.reindex(columns=unique_expected_features, fill_value=0)
+                         
+                         # 6. 최종 형태 검증 (선택 사항이지만 디버깅에 유용)
+                         final_shape = features_for_prediction.shape
+                         if final_shape[1] != len(unique_expected_features):
+                              self.logger.error(f"최종 특성 수 불일치 오류! 예상: {len(unique_expected_features)}, 실제: {final_shape[1]}. 로직 검토 필요.")
+                         # else:
+                         #      self.logger.debug(f"특성 준비 완료. 최종 형태: {final_shape}")
+
+                except KeyError as e:
+                     self.logger.error(f"expected_features 선택 중 KeyError 발생: {e}. 사용 가능한 컬럼: {current_data_slice.columns.tolist()}", exc_info=True)
+                     features_for_prediction = pd.DataFrame() # 빈 데이터프레임 전달하여 오류 처리 유도
+                except Exception as e:
+                    self.logger.error(f"특성 선택 중 예상치 못한 오류 발생: {e}", exc_info=True)
+                    features_for_prediction = pd.DataFrame() # 빈 데이터프레임 전달
+            else:
+                # expected_features가 없으면 일단 마지막 행 전체 사용 (경고 로깅)
+                self.logger.warning("전략 객체에 expected_features 속성이 없거나 비어있습니다. 마지막 행의 모든 특성을 사용합니다.")
+                features_for_prediction = current_data_slice.iloc[-1:]
+            # --- 수정 끝 ---
+
+            # Generate signal using the data slice
+            try:
+                # 필터링된 특성 데이터(마지막 행)를 전달
+                # generate_signal 구현에 따라 딕셔너리 또는 DataFrame 직접 전달 필요
+                # 현재 TradingEnsemble은 generate_signal에서 predict를 호출하며, predict는 DataFrame 입력을 처리함
+                signal = strategy.generate_signal(features_for_prediction) # DataFrame 직접 전달
+            except Exception as e: # generate_signal 내부 오류 처리 강화
+                self.logger.error(f"신호 생성 중 예외 발생: {e}", exc_info=True)
+                signal = {'signal': 'HOLD', 'reason': f"신호 생성 오류: {e}"} # 오류 발생 시 HOLD
+
+            # 신호 유효성 검증 추가
+            if not isinstance(signal, dict) or 'signal' not in signal:
+                 self.logger.error(f"잘못된 신호 형식 수신: {signal}. HOLD로 처리합니다.")
+                 signal = {'signal': 'HOLD', 'reason': '잘못된 신호 형식'}
+                
+                 # 현재 포지션 가치 업데이트만 수행하고 다음 데이터로 진행 (들여쓰기 수정)
+                 portfolio['position_value'] = portfolio['position'] * current_price
+                 portfolio['total_value'] = portfolio['cash'] + portfolio['position_value']
+                 portfolio['equity_curve'].append(portfolio['total_value'])
+
+                 # 진행 상황 표시 (들여쓰기 수정)
+                 if processed_days % progress_interval == 0:
+                     progress_pct = processed_days / total_days * 100
+                     self.logger.info(f"백테스트 진행: {progress_pct:.1f}% ({processed_days}/{total_days})")
+                 
+                 # 하루 종료 후 일별 수익률 계산 (들여쓰기 수정)
+                 if prev_date is not None and timestamp.date() != prev_date.date():
+                     daily_return = (portfolio['total_value'] / prev_day_value) - 1
+                     portfolio['daily_returns'].append(daily_return)
+                     
+                 prev_date = timestamp # (들여쓰기 수정)
+                 prev_day_value = portfolio['total_value'] # (들여쓰기 수정)
+                 
+                 # 다음 데이터로 진행 (들여쓰기 수정)
+                 continue
+                
+            # 연속된 같은 신호 추적
+            if signal['signal'] == portfolio['last_signal']:
                 portfolio['consecutive_signals'] += 1
             else:
-                portfolio['consecutive_signals'] = 1
+                portfolio['consecutive_signals'] = 1  # 새로운 신호, 카운터 리셋
                 
             portfolio['last_signal'] = signal['signal']
             portfolio['last_signal_time'] = timestamp
@@ -272,8 +423,37 @@ class BacktestEngine:
                         portfolio['last_trade_time'] = timestamp
                         
                         # 거래 로그 수준 향상 (DEBUG에서 INFO로)
-                        self.logger.info(f"BUY: {position_size:.8f} {strategy.market} @ {execution_price:.2f} = "
+                        self.logger.debug(f"BUY: {position_size:.8f} {strategy.market} @ {execution_price:.2f} = "
                                         f"{position_cost:.2f} (commission: {commission:.2f})")
+                        
+                        # 데이터베이스에 거래 기록 저장
+                        try:
+                            from utils.database import save_trade
+                            
+                            # 메타데이터 준비
+                            metadata = {
+                                'commission': commission,
+                                'balance_after': portfolio['cash'],
+                                'timestamp': timestamp.isoformat(),
+                                'trade_count': len(portfolio['trades']) + 1
+                            }
+                            
+                            # 데이터베이스에 저장
+                            save_trade(
+                                trade_type='BUY',
+                                ticker=strategy.market,
+                                price=execution_price,
+                                amount=position_size,
+                                total=position_cost,
+                                reason=signal.get('reason', 'Strategy signal'),
+                                strategy=strategy.name,
+                                confidence=signal.get('confidence', 0.5),
+                                metadata=metadata
+                            )
+                        except ImportError:
+                            self.logger.warning("거래 데이터베이스 저장 실패: utils.database 모듈을 가져올 수 없습니다.")
+                        except Exception as e:
+                            self.logger.error(f"거래 데이터베이스 저장 오류: {str(e)}")
                         
                         # Add trade to history
                         trade = {
@@ -310,6 +490,20 @@ class BacktestEngine:
                     position_value = position_size * execution_price
                     commission = position_value * self.commission_rate
                     
+                    # position_cost 변수 정의 - 매입 단가를 계산
+                    # 최근 BUY 거래의 가격을 찾거나, 없으면 현재 시장 가격으로 계산
+                    position_cost = 0
+                    for past_trade in reversed(portfolio['trades']):  # 가장 최근 거래부터 역순으로 확인
+                        if past_trade['type'] == 'BUY':
+                            position_cost = position_size * past_trade['price']  # 가장 최근 매수 가격으로 계산
+                            break
+                    
+                    # 매수 기록이 없으면 현재 포지션의 평균 매입가를 추정
+                    if position_cost == 0:
+                        # 현재가의 95%를 매입가로 가정 (보수적인 수익 추정)
+                        position_cost = position_size * (current_price * 0.95)
+                        self.logger.warning(f"매수 기록을 찾을 수 없어 현재가 기준으로 매입가를 추정합니다: {current_price * 0.95:.2f}")
+                    
                     # Execute sell
                     portfolio['cash'] += (position_value - commission)
                     portfolio['position'] -= position_size  # 매도한 만큼만 포지션 감소
@@ -318,8 +512,39 @@ class BacktestEngine:
                     portfolio['last_trade_time'] = timestamp
                     
                     # 거래 로그 수준 향상 (DEBUG에서 INFO로)
-                    self.logger.info(f"SELL: {position_size:.8f} {strategy.market} @ {execution_price:.2f} = "
+                    self.logger.debug(f"SELL: {position_size:.8f} {strategy.market} @ {execution_price:.2f} = "
                                     f"{position_value:.2f} (commission: {commission:.2f})")
+                    
+                    # 데이터베이스에 거래 기록 저장
+                    try:
+                        from utils.database import save_trade
+                        
+                        # 메타데이터 준비
+                        metadata = {
+                            'commission': commission,
+                            'balance_after': portfolio['cash'],
+                            'timestamp': timestamp.isoformat(),
+                            'trade_count': len(portfolio['trades']) + 1,
+                            'profit_loss': position_value - position_cost,
+                            'profit_loss_pct': (position_value - position_cost) / position_cost
+                        }
+                        
+                        # 데이터베이스에 저장
+                        save_trade(
+                            trade_type='SELL',
+                            ticker=strategy.market,
+                            price=execution_price,
+                            amount=position_size,
+                            total=position_value,
+                            reason=signal.get('reason', 'Strategy signal'),
+                            strategy=strategy.name,
+                            confidence=signal.get('confidence', 0.5),
+                            metadata=metadata
+                        )
+                    except ImportError:
+                        self.logger.warning("거래 데이터베이스 저장 실패: utils.database 모듈을 가져올 수 없습니다.")
+                    except Exception as e:
+                        self.logger.error(f"거래 데이터베이스 저장 오류: {str(e)}")
                     
                     # Add trade to history
                     trade = {
@@ -330,7 +555,8 @@ class BacktestEngine:
                         'value': position_value,
                         'commission': commission,
                         'balance_after': portfolio['cash'],
-                        'position_size': position_size,
+                        'profit_loss': position_value - position_cost,  # 실제 수익/손실 금액
+                        'returns': (position_value - position_cost) / position_cost,  # 수익률로 이름 통일 (기존 profit_loss_pct)
                         'reason': signal.get('reason', 'Strategy signal')
                     }
                     portfolio['trades'].append(trade)
@@ -345,7 +571,7 @@ class BacktestEngine:
         
         # Final portfolio valuation
         final_balance = portfolio['total_value']
-        returns = (final_balance / self.initial_balance) - 1
+        returns = (final_balance / self.initial_balance) - 1  # 수익률
         
         # Create result object
         result = BacktestResult(
@@ -355,7 +581,7 @@ class BacktestEngine:
             end_date=end_date,
             initial_balance=self.initial_balance,
             final_balance=final_balance,
-            returns=returns,
+            returns=returns,  # 수익률
             trades=portfolio['trades'],
             daily_returns=portfolio['daily_returns'],
             equity_curve=portfolio['equity_curve'],
@@ -407,6 +633,24 @@ class BacktestEngine:
             data (pd.DataFrame): 사용된 시장 데이터
         """
         logger.info("백테스트 결과 검증 시작...")
+        
+        # 0. 거래 없이 수익이 발생한 경우 - 강제 수정
+        if len(result.trades) == 0 and result.returns != 0:
+            logger.error(f"❗ 심각한 오류: 거래가 없는데 수익률({result.returns:.2%})이 발생했습니다. 수익률을 0으로 강제 리셋합니다.")
+            # 수익률 강제 리셋
+            result.returns = 0.0
+            result.final_balance = result.initial_balance
+            
+            # 주식 곡선 리셋
+            result.equity_curve = [result.initial_balance for _ in result.equity_curve]
+            
+            # 지표 리셋
+            if 'monthly_return' in result.metrics:
+                result.metrics['monthly_return'] = 0.0
+            if 'annualized_return' in result.metrics:
+                result.metrics['annualized_return'] = 0.0
+            if 'sharpe_ratio' in result.metrics:
+                result.metrics['sharpe_ratio'] = 0.0
         
         # 1. 비정상적으로 높은 수익률 확인
         if result.returns > 1.0:  # 100% 이상
@@ -527,7 +771,7 @@ class BacktestEngine:
             
             # Add indicators if not already added
             if 'rsi_14' not in data.columns:
-                data = add_indicators(data)
+                data = calculate_all_indicators(data)
         else:
             self.logger.info(f"Using provided data with {len(data)} rows")
         
@@ -708,4 +952,50 @@ class BacktestEngine:
             self.logger.error(f"시장 조건 분석 중 오류 발생: {str(e)}")
             import traceback
             self.logger.error(traceback.format_exc())
-            return {"error": f"시장 조건 분석 중 오류 발생: {str(e)}"} 
+            return {"error": f"시장 조건 분석 중 오류 발생: {str(e)}"}
+
+    @log_execution
+    def run_backtest(self) -> BacktestResult:
+        """
+        설정에 따라 백테스트 실행
+        
+        Returns:
+            BacktestResult: 백테스트 결과 객체
+        """
+        # 전략 초기화
+        try:
+            from main import initialize_strategy
+            strategy = initialize_strategy(self.config)
+        except Exception as e:
+            self.logger.error(f"전략 초기화 실패: {str(e)}")
+            raise ValueError(f"전략 초기화 실패: {str(e)}")
+        
+        # 데이터 준비
+        try:
+            # 데이터 수집기 사용
+            from data.collectors import get_historical_data
+            
+            # 데이터 수집
+            data = get_historical_data(
+                ticker=self.market,
+                days=365,  # 백테스트 기간
+                indicators=True,  # 인디케이터 추가
+                verbose=True,
+                extend_with_synthetic=False
+            )
+            
+            if data is None or data.empty:
+                raise ValueError(f"수집된 데이터가 없습니다: {self.market}, {self.timeframe}, {self.start_date} ~ {self.end_date}")
+                
+        except Exception as e:
+            self.logger.error(f"데이터 수집 중 오류 발생: {str(e)}")
+            raise ValueError(f"데이터 수집 실패: {str(e)}")
+        
+        # 백테스트 실행
+        return self.run(
+            strategy=strategy,
+            start_date=self.start_date,
+            end_date=self.end_date,
+            data=data,
+            use_daily_only=self.timeframe == 'day'
+        ) 

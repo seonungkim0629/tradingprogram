@@ -4,31 +4,29 @@ Data collection module for Bitcoin Trading Bot
 This module provides functionality to collect market data from Upbit exchange API.
 """
 
+import os
 import time
 import json
-import datetime
-from typing import List, Dict, Any, Optional, Tuple, Union
-import concurrent.futures
-import requests
-import pyupbit
+import traceback
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-import traceback
-import os
+import requests
+import pyupbit
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple, Union, Any
+import concurrent.futures
 from dateutil.relativedelta import relativedelta
 
+# 설정 및 유틸리티 모듈
 from config import settings
 from utils.logging import get_logger, log_execution
 from utils.monitoring import track_api_call
-from data.indicators import add_indicators
-from data.storage import save_ohlcv_data
-from models.ensemble import VotingEnsemble
-from models.random_forest import RandomForestDirectionModel
-from models.gru import GRUDirectionModel
+
+# 데이터 관련 모듈
+from data.indicators import calculate_all_indicators as add_indicators
 from models.base import ClassificationModel
 
-# Initialize logger
+# 로거 설정
 logger = get_logger(__name__)
 
 class UpbitDataCollector:
@@ -45,6 +43,34 @@ class UpbitDataCollector:
         self.access_key = access_key or settings.UPBIT_ACCESS_KEY
         self.secret_key = secret_key or settings.UPBIT_SECRET_KEY
         self.upbit = None
+        
+        # 타임프레임별 API 엔드포인트 매핑
+        self._interval_mappings = {
+            'minute1': 'minute1', 
+            'minute3': 'minute3', 
+            'minute5': 'minute5', 
+            'minute10': 'minute10',
+            'minute15': 'minute15', 
+            'minute30': 'minute30', 
+            'minute60': 'minute60', 
+            'minute240': 'minute240',
+            'day': 'day',
+            'week': 'week',
+            'month': 'month'
+        }
+        
+        # API 호출 간격 제한
+        self._api_call_intervals = {
+            'day': 0.2,        # 일봉 데이터는 빠르게 가져올 수 있음
+            'minute60': 0.2,   # 시간봉
+            'minute5': 0.3,    # 5분봉
+            'minute1': 0.3,    # 1분봉
+            'default': 0.1     # 기타
+        }
+        
+        # 데이터 저장 경로 정의
+        self.data_dir = settings.DATA_DIR
+        self.ohlcv_dir = settings.OHLCV_DIR
         
         if self.access_key and self.secret_key:
             try:
@@ -96,12 +122,11 @@ class UpbitDataCollector:
     @log_execution
     def get_ohlcv(self, ticker: str = None, interval: str = "day", count: int = 200, to: str = None) -> Optional[pd.DataFrame]:
         """
-        Get OHLCV data
+        Get OHLCV data from Upbit API
         
         Args:
             ticker (str, optional): Ticker symbol. Defaults to settings.DEFAULT_MARKET.
-            interval (str, optional): Time interval ('day', 'minute1', 'minute3', 'minute5', 'minute10', 
-                                      'minute15', 'minute30', 'minute60', 'minute240', 'week', 'month'). 
+            interval (str, optional): Time interval ('day', 'minute1', 'minute3', 'minute5', etc). 
                                       Defaults to "day".
             count (int, optional): Number of candles to retrieve (max 200). Defaults to 200.
             to (str, optional): End date in format 'YYYY-MM-DD HH:MM:SS'. Defaults to None.
@@ -110,31 +135,51 @@ class UpbitDataCollector:
             Optional[pd.DataFrame]: DataFrame containing OHLCV data or None if error
         """
         try:
+            # 기본값 설정
             ticker = ticker or settings.DEFAULT_MARKET
+            
+            # 지원되는 타임프레임인지 확인
+            if interval not in self._interval_mappings:
+                logger.warning(f"Unsupported interval: {interval}. Using 'day' instead.")
+                interval = 'day'
+                
+            # API 호출 시작 시간 기록
+            start_time = time.time()
+                
+            # API 요청 추적
             track_api_call("upbit", f"ohlcv_{interval}")
             
-            # If 'to' parameter is provided, use it
+            # API 요청 수행
             if to:
                 df = pyupbit.get_ohlcv(ticker=ticker, interval=interval, count=count, to=to)
             else:
                 df = pyupbit.get_ohlcv(ticker=ticker, interval=interval, count=count)
             
+            # API 호출 결과 확인
             if df is None or df.empty:
                 logger.warning(f"No OHLCV data returned for {ticker} ({interval})")
                 return None
             
-            # Add ticker column for identification when storing multiple tickers
+            # 필요한 메타데이터 추가
             df['ticker'] = ticker
             
-            # Make sure all required columns are present
+            # 컬럼명 일관성 확인 및 필요시 조정
             expected_columns = ['open', 'high', 'low', 'close', 'volume', 'value']
-            if not all(col in df.columns for col in expected_columns):
-                logger.warning(f"Missing columns in OHLCV data for {ticker}: {set(expected_columns) - set(df.columns)}")
+            for col in expected_columns:
+                if col not in df.columns and col != 'value':  # value는 없을 수 있음
+                    logger.warning(f"Missing column '{col}' in OHLCV data for {ticker}")
             
+            # API 호출 간격 유지 (레이트 리밋 방지)
+            elapsed = time.time() - start_time
+            wait_time = self._api_call_intervals.get(interval, self._api_call_intervals['default']) - elapsed
+            if wait_time > 0:
+                time.sleep(wait_time)
+                
             return df
-        
+            
         except Exception as e:
             logger.error(f"Error getting OHLCV data for {ticker} ({interval}): {str(e)}")
+            logger.debug(traceback.format_exc())
             return None
     
     @log_execution
@@ -171,7 +216,7 @@ class UpbitDataCollector:
     @log_execution
     def get_daily_ohlcv(self, ticker: str = None, since: str = None, to: str = None) -> Optional[pd.DataFrame]:
         """
-        Get daily OHLCV data for an extended period
+        Get daily OHLCV data for an extended period by making multiple API calls
         
         Args:
             ticker (str, optional): Ticker symbol. Defaults to settings.DEFAULT_MARKET.
@@ -198,154 +243,243 @@ class UpbitDataCollector:
             since_dt = datetime.strptime(since, '%Y-%m-%d')
             to_dt = datetime.strptime(to, '%Y-%m-%d')
             
-            # Calculate number of days
-            days_diff = (to_dt - since_dt).days
+            # Calculate days between dates
+            days_difference = (to_dt - since_dt).days
             
-            # If more than 200 days (Upbit API limit), make multiple calls
-            if days_diff > 200:
-                all_data = []
-                current_to_dt = to_dt
+            # Check if dates are valid
+            if days_difference <= 0:
+                logger.error(f"Invalid date range: {since} to {to}")
+                return None
+            
+            # If the range is less than 200 days, we can get it in one call
+            if days_difference <= 200:
+                return self.get_ohlcv(ticker=ticker, interval="day", count=days_difference, to=to)
+            
+            # Otherwise, we need to make multiple calls
+            all_df = []
+            
+            # Calculate number of iterations (200 days per call)
+            iterations = (days_difference // 200) + (1 if days_difference % 200 > 0 else 0)
+            
+            current_to = to_dt
+            
+            for i in range(iterations):
+                # Format current_to as string
+                current_to_str = current_to.strftime('%Y-%m-%d %H:%M:%S')
                 
-                while current_to_dt >= since_dt:
-                    current_since_dt = max(current_to_dt - timedelta(days=199), since_dt)
-                    current_since = current_since_dt.strftime('%Y-%m-%d')
-                    current_to = current_to_dt.strftime('%Y-%m-%d')
+                # Get data for this interval
+                curr_count = min(200, (current_to - since_dt).days)
+                logger.debug(f"Getting daily data batch {i+1}/{iterations}, to={current_to_str}, count={curr_count}")
+                
+                df = self.get_ohlcv(ticker=ticker, interval="day", count=curr_count, to=current_to_str)
+                
+                if df is not None and not df.empty:
+                    all_df.append(df)
                     
-                    track_api_call("upbit", "ohlcv_day_extended")
-                    
-                    # Add a slight delay to avoid API rate limits
-                    time.sleep(0.2)
-                    
-                    df = pyupbit.get_ohlcv(ticker=ticker, interval="day", to=current_to)
-                    
-                    if df is not None and not df.empty:
-                        # Filter by date range
-                        df = df[df.index >= pd.Timestamp(current_since)]
-                        df = df[df.index <= pd.Timestamp(current_to)]
-                        all_data.append(df)
-                    
-                    current_to_dt = current_since_dt - timedelta(days=1)
+                    # Update current_to to be one day before the earliest date in df
+                    if len(df) > 0:
+                        earliest_date = df.index.min()
+                        current_to = earliest_date.to_pydatetime() - timedelta(days=1)
+                    else:
+                        # Not enough data, break the loop
+                        break
+                else:
+                    logger.warning(f"No data returned for interval {i+1}/{iterations}")
+                    break
                 
-                if not all_data:
-                    logger.warning(f"No data returned for {ticker} between {since} and {to}")
-                    return None
+                # Check if we've reached or passed the start date
+                if current_to <= since_dt:
+                    break
                 
-                # Combine all data
-                combined_df = pd.concat(all_data)
-                combined_df = combined_df.sort_index()
+                # Add delay between API calls to avoid rate limiting
+                time.sleep(0.5)
+            
+            # Combine all data frames
+            if not all_df:
+                logger.warning("No data collected for any interval")
+                return None
                 
-                # Remove duplicates
-                combined_df = combined_df[~combined_df.index.duplicated(keep='first')]
-                
-                # Add ticker column
-                combined_df['ticker'] = ticker
-                
-                return combined_df
-            else:
-                # Single API call is sufficient
-                track_api_call("upbit", "ohlcv_day_single")
-                df = pyupbit.get_ohlcv(ticker=ticker, interval="day", to=to)
-                
-                if df is None or df.empty:
-                    logger.warning(f"No data returned for {ticker} between {since} and {to}")
-                    return None
-                
-                # Filter by date range
-                df = df[df.index >= pd.Timestamp(since)]
-                df = df[df.index <= pd.Timestamp(to)]
-                
-                # Add ticker column
-                df['ticker'] = ticker
-                
-                return df
-        
+            combined_df = pd.concat(all_df)
+            
+            # Remove duplicates and sort by date
+            combined_df = combined_df[~combined_df.index.duplicated(keep='first')]
+            combined_df = combined_df.sort_index()
+            
+            # Filter to match the original date range
+            mask = (combined_df.index >= since_dt) & (combined_df.index <= to_dt)
+            combined_df = combined_df.loc[mask]
+            
+            logger.info(f"Collected {len(combined_df)} days of OHLCV data for {ticker}")
+            
+            return combined_df
+            
         except Exception as e:
             logger.error(f"Error getting daily OHLCV data for {ticker}: {str(e)}")
+            logger.debug(traceback.format_exc())
             return None
     
     @log_execution
-    def get_hourly_ohlcv(self, ticker: str = None, count: int = 2000) -> Optional[pd.DataFrame]:
+    def get_extended_timeframe_data(self, ticker: str = None, interval: str = "minute60", count: int = 200,
+                                   max_iterations: int = 10) -> Optional[pd.DataFrame]:
         """
-        Get hourly OHLCV data (uses minute60 interval)
+        특정 타임프레임의 데이터를 여러 API 호출을 통해 더 많이 가져옴
         
         Args:
-            ticker (str, optional): Ticker symbol. Defaults to settings.DEFAULT_MARKET.
-            count (int, optional): Number of hours to retrieve. Defaults to 2000.
+            ticker (str, optional): 티커 심볼. Defaults to settings.DEFAULT_MARKET.
+            interval (str, optional): 시간 간격. Defaults to "minute60".
+            count (int, optional): 각 API 호출당 가져올 캔들 수 (최대 200). Defaults to 200.
+            max_iterations (int, optional): 최대 API 호출 횟수. Defaults to 10.
             
         Returns:
-            Optional[pd.DataFrame]: DataFrame containing hourly OHLCV data or None if error
+            Optional[pd.DataFrame]: OHLCV 데이터를 포함하는 DataFrame 또는 오류 시 None
         """
         ticker = ticker or settings.DEFAULT_MARKET
+        interval_map = {
+            'hour': 'minute60',
+            'minute60': 'minute60',
+            'minute5': 'minute5',
+            'minute1': 'minute1'
+        }
+        
+        # 간격 매핑 확인 및 변환
+        if interval in interval_map:
+            interval = interval_map[interval]
+        elif interval not in self._interval_mappings:
+            logger.warning(f"Unsupported interval: {interval}. Using 'minute60' instead.")
+            interval = 'minute60'
+            
+        logger.info(f"Fetching extended {interval} data for {ticker}, max {count*max_iterations} candles")
+        
+        all_df = []
+        current_to = None
         
         try:
-            # Upbit API can only retrieve 200 candles at a time
-            max_per_call = 200
-            total_calls = (count + max_per_call - 1) // max_per_call  # Ceiling division
-            
-            all_data = []
-            to_datetime = datetime.now()
-            
-            for _ in range(total_calls):
-                to_date = to_datetime.strftime('%Y-%m-%d %H:%M:%S')
-                
-                track_api_call("upbit", "ohlcv_hour")
-                
-                # Add a slight delay to avoid API rate limits
-                time.sleep(0.3)
-                
-                df = pyupbit.get_ohlcv(ticker=ticker, interval="minute60", to=to_date, count=min(count, max_per_call))
+            for i in range(max_iterations):
+                # Get data for this batch
+                df = self.get_ohlcv(ticker=ticker, interval=interval, count=count, to=current_to)
                 
                 if df is not None and not df.empty:
-                    all_data.append(df)
+                    all_df.append(df)
                     
-                    # Update to_datetime for next batch
-                    if len(df) > 0:
-                        to_datetime = df.index[0].to_pydatetime() - timedelta(hours=1)
-                        count -= len(df)
-                    else:
-                        break
+                    # Update 'to' parameter to the earliest timestamp minus one minute
+                    earliest_time = df.index.min()
+                    current_to = (earliest_time - pd.Timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    logger.debug(f"Batch {i+1}/{max_iterations}: Got {len(df)} candles, next to={current_to}")
                 else:
+                    logger.warning(f"No data returned for batch {i+1}/{max_iterations}")
                     break
                 
-                if count <= 0:
+                # Delay between API calls
+                time.sleep(self._api_call_intervals.get(interval, 0.2))
+                
+                # If we got less than requested, we've reached the limit
+                if len(df) < count:
+                    logger.debug(f"Got {len(df)} < {count} candles, reached the limit")
                     break
             
-            if not all_data:
-                logger.warning(f"No hourly OHLCV data returned for {ticker}")
+            # Combine all data frames
+            if not all_df:
+                logger.warning(f"No {interval} data collected for {ticker}")
                 return None
+                
+            combined_df = pd.concat(all_df)
             
-            # Combine all data
-            combined_df = pd.concat(all_data)
+            # Remove duplicates and sort by date
+            combined_df = combined_df[~combined_df.index.duplicated(keep='first')]
             combined_df = combined_df.sort_index()
             
-            # Remove duplicates
-            combined_df = combined_df[~combined_df.index.duplicated(keep='first')]
-            
-            # Add ticker column
-            combined_df['ticker'] = ticker
+            logger.info(f"Collected {len(combined_df)} {interval} candles for {ticker}")
             
             return combined_df
-        
+            
         except Exception as e:
-            logger.error(f"Error getting hourly OHLCV data for {ticker}: {str(e)}")
+            logger.error(f"Error getting extended {interval} data for {ticker}: {str(e)}")
+            logger.debug(traceback.format_exc())
             return None
+            
+    @log_execution
+    def get_hourly_ohlcv(self, ticker: str = None, count: int = 2000) -> Optional[pd.DataFrame]:
+        """
+        시간봉 데이터 가져오기 (최대 2000개)
+        
+        Args:
+            ticker (str, optional): 티커 심볼. Defaults to settings.DEFAULT_MARKET.
+            count (int, optional): 가져올 캔들 수. Defaults to 2000.
+            
+        Returns:
+            Optional[pd.DataFrame]: 시간봉 데이터를 포함하는 DataFrame 또는 오류 시 None
+        """
+        # 최대 API 호출 횟수 계산 (200개씩 가져올 때)
+        max_iterations = min(10, (count + 199) // 200)  # 최대 10회 API 호출 (2000개)
+        
+        return self.get_extended_timeframe_data(
+            ticker=ticker,
+            interval="minute60",
+            count=min(200, count),  # 한 번에 최대 200개 가능
+            max_iterations=max_iterations
+        )
+    
+    @log_execution
+    def get_minute5_ohlcv(self, ticker: str = None, count: int = 1000) -> Optional[pd.DataFrame]:
+        """
+        5분봉 데이터 가져오기 (최대 1000개)
+        
+        Args:
+            ticker (str, optional): 티커 심볼. Defaults to settings.DEFAULT_MARKET.
+            count (int, optional): 가져올 캔들 수. Defaults to 1000.
+            
+        Returns:
+            Optional[pd.DataFrame]: 5분봉 데이터를 포함하는 DataFrame 또는 오류 시 None
+        """
+        # 최대 API 호출 횟수 계산 (200개씩 가져올 때)
+        max_iterations = min(5, (count + 199) // 200)  # 최대 5회 API 호출 (1000개)
+        
+        return self.get_extended_timeframe_data(
+            ticker=ticker,
+            interval="minute5",
+            count=min(200, count),  # 한 번에 최대 200개 가능
+            max_iterations=max_iterations
+        )
+    
+    @log_execution
+    def get_minute1_ohlcv(self, ticker: str = None, count: int = 500) -> Optional[pd.DataFrame]:
+        """
+        1분봉 데이터 가져오기 (최대 500개)
+        
+        Args:
+            ticker (str, optional): 티커 심볼. Defaults to settings.DEFAULT_MARKET.
+            count (int, optional): 가져올 캔들 수. Defaults to 500.
+            
+        Returns:
+            Optional[pd.DataFrame]: 1분봉 데이터를 포함하는 DataFrame 또는 오류 시 None
+        """
+        # 최대 API 호출 횟수 계산 (200개씩 가져올 때)
+        max_iterations = min(3, (count + 199) // 200)  # 최대 3회 API 호출 (500개)
+        
+        return self.get_extended_timeframe_data(
+            ticker=ticker,
+            interval="minute1",
+            count=min(200, count),  # 한 번에 최대 200개 가능
+            max_iterations=max_iterations
+        )
     
     @log_execution
     def get_account_balance(self) -> Optional[List[Dict[str, Any]]]:
         """
-        Get account balance information
+        계정 잔고 정보 가져오기
         
         Returns:
-            Optional[List[Dict[str, Any]]]: List of account balances or None if error
+            Optional[List[Dict[str, Any]]]: 잔고 정보 리스트 또는 오류 시 None
         """
         if not self.upbit:
-            logger.error("Cannot get account balance: Upbit API not authenticated")
+            logger.error("Upbit API not authenticated. Cannot get account balance.")
             return None
-        
+            
         try:
-            track_api_call("upbit", "balance")
-            balances = self.upbit.get_balances()
-            return balances
+            track_api_call("upbit", "account_balance")
+            balance = self.upbit.get_balances()
+            return balance
         except Exception as e:
             logger.error(f"Error getting account balance: {str(e)}")
             return None
@@ -353,33 +487,47 @@ class UpbitDataCollector:
     @log_execution
     def get_ticker_info(self, ticker: str = None) -> Optional[Dict[str, Any]]:
         """
-        Get detailed information about a ticker
+        특정 티커의 상세 정보 가져오기
         
         Args:
-            ticker (str, optional): Ticker symbol. Defaults to settings.DEFAULT_MARKET.
+            ticker (str, optional): 티커 심볼. Defaults to settings.DEFAULT_MARKET.
             
         Returns:
-            Optional[Dict[str, Any]]: Dictionary containing ticker information or None if error
+            Optional[Dict[str, Any]]: 티커 정보 또는 오류 시 None
         """
         ticker = ticker or settings.DEFAULT_MARKET
         
+        # API에서 티커 정보 가져오기
         try:
-            url = f"https://api.upbit.com/v1/ticker?markets={ticker}"
-            
             track_api_call("upbit", "ticker_info")
             
+            # 모든 마켓 정보 가져오기
+            url = "https://api.upbit.com/v1/market/all"
             response = requests.get(url)
             response.raise_for_status()
+            markets = response.json()
             
-            data = response.json()
-            if data and len(data) > 0:
-                return data[0]
-            else:
-                logger.warning(f"No ticker information returned for {ticker}")
+            # 해당 티커 찾기
+            ticker_info = next((market for market in markets if market['market'] == ticker), None)
+            
+            if not ticker_info:
+                logger.warning(f"Ticker {ticker} not found in markets")
                 return None
-        
+            
+            # 추가 정보 가져오기 (24시간 동안의 가격 정보)
+            current_info = pyupbit.get_current_price(ticker, verbose=True)
+            
+            if not current_info or not isinstance(current_info, list) or len(current_info) == 0:
+                logger.warning(f"Failed to get current info for {ticker}")
+                return ticker_info  # 티커 기본 정보만 반환
+            
+            # 현재 가격 정보 추가
+            ticker_info.update(current_info[0])
+            
+            return ticker_info
+            
         except Exception as e:
-            logger.error(f"Error getting ticker information for {ticker}: {str(e)}")
+            logger.error(f"Error getting ticker info for {ticker}: {str(e)}")
             return None
 
 
@@ -390,25 +538,63 @@ upbit_collector = UpbitDataCollector()
 @log_execution
 def get_market_data(ticker: str = None, timeframe: str = "day", count: int = 200) -> Optional[pd.DataFrame]:
     """
-    Convenience function to get market data from Upbit
+    Upbit에서 시장 데이터를 가져와 DataFrame으로 반환
     
     Args:
-        ticker (str, optional): Ticker symbol. Defaults to settings.DEFAULT_MARKET.
-        timeframe (str, optional): Time interval. Defaults to "day".
-        count (int, optional): Number of candles to retrieve. Defaults to 200.
+        ticker (str, optional): 티커 심볼. Defaults to settings.DEFAULT_MARKET.
+        timeframe (str, optional): 시간 프레임 ('day', 'hour', 'minute5', 'minute1').
+                                  Defaults to "day".
+        count (int, optional): 가져올 캔들 개수. Defaults to 200.
         
     Returns:
-        Optional[pd.DataFrame]: DataFrame containing market data or None if error
+        Optional[pd.DataFrame]: OHLCV 데이터를 포함하는 DataFrame 또는 오류 시 None
     """
     ticker = ticker or settings.DEFAULT_MARKET
+    logger.info(f"Getting {timeframe} market data for {ticker}, count={count}")
     
-    if timeframe == "hour" or timeframe == "minute60":
-        return upbit_collector.get_hourly_ohlcv(ticker=ticker, count=count)
-    elif timeframe == "day":
-        return upbit_collector.get_ohlcv(ticker=ticker, interval="day", count=min(count, 200))
-    else:
-        # Handle other timeframes
-        return upbit_collector.get_ohlcv(ticker=ticker, interval=timeframe, count=min(count, 200))
+    # 시간 프레임 매핑
+    timeframe_mapping = {
+        'day': 'day',
+        'hour': 'minute60',
+        'minute60': 'minute60',
+        'minute5': 'minute5',
+        'minute1': 'minute1'
+    }
+    
+    # 업비트 API의 interval로 변환
+    interval = timeframe_mapping.get(timeframe, 'day')
+    
+    try:
+        # UpbitDataCollector 인스턴스 생성
+        collector = UpbitDataCollector()
+        
+        # 타임프레임별 다른 메소드 호출
+        if timeframe == 'day':
+            df = collector.get_daily_ohlcv(ticker=ticker, to=None, since=None)
+            if df is None or df.empty:
+                # 일별 데이터가 없으면 기본 API로 시도
+                df = collector.get_ohlcv(ticker=ticker, interval=interval, count=min(count, 200))
+        elif timeframe == 'hour' or timeframe == 'minute60':
+            df = collector.get_hourly_ohlcv(ticker=ticker, count=count)
+        elif timeframe == 'minute5':
+            df = collector.get_minute5_ohlcv(ticker=ticker, count=count)
+        elif timeframe == 'minute1':
+            df = collector.get_minute1_ohlcv(ticker=ticker, count=count)
+        else:
+            # 지원되지 않는 타임프레임은 기본 API 사용
+            df = collector.get_ohlcv(ticker=ticker, interval=interval, count=min(count, 200))
+        
+        if df is None or df.empty:
+            logger.warning(f"No {timeframe} data available for {ticker}")
+            return None
+            
+        logger.info(f"Got {len(df)} {timeframe} candles for {ticker}")
+        return df
+        
+    except Exception as e:
+        logger.error(f"Error getting {timeframe} market data for {ticker}: {str(e)}")
+        logger.debug(traceback.format_exc())
+        return None
 
 
 @log_execution
@@ -424,163 +610,211 @@ def get_historical_data(ticker: str = None,
                       extend_with_synthetic: bool = False,
                       train_models: bool = False) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
     """
-    Get historical daily data for a given ticker
+    Get historical market data with optional indicators and splits for ML
     
     Args:
         ticker (str, optional): Ticker symbol. Defaults to settings.DEFAULT_MARKET.
-        days (int, optional): Number of days to fetch. Defaults to 100.
-        indicators (bool, optional): Whether to add indicators. Defaults to True.
-        verbose (bool, optional): Whether to print progress. Defaults to True.
-        source (str, optional): Data source. Defaults to "upbit".
-        split (bool, optional): Whether to split data into train/validation/test sets. Defaults to False.
-        train_days (int, optional): Number of days for training set. Defaults to 650.
-        validation_days (int, optional): Number of days for validation set. Defaults to 150.
-        test_days (int, optional): Number of days for test set. Defaults to 200.
-        extend_with_synthetic (bool, optional): Whether to extend data with synthetic samples. Defaults to False.
+        days (int, optional): Number of days to retrieve. Defaults to 100.
+        indicators (bool, optional): Whether to add technical indicators. Defaults to True.
+        verbose (bool, optional): Whether to print verbose output. Defaults to True.
+        source (str, optional): Data source ("upbit", "file"). Defaults to "upbit".
+        split (bool, optional): Whether to split data for ML. Defaults to False.
+        train_days (int, optional): Days for training set. Defaults to 650.
+        validation_days (int, optional): Days for validation set. Defaults to 150.
+        test_days (int, optional): Days for test set. Defaults to 200.
+        extend_with_synthetic (bool, optional): Whether to add synthetic data. Defaults to False.
         train_models (bool, optional): Whether to train models with the data. Defaults to False.
         
     Returns:
-        Union[pd.DataFrame, Dict[str, pd.DataFrame]]: Historical market data or data splits if split=True
+        Union[pd.DataFrame, Dict[str, pd.DataFrame]]: DataFrame or dict of DataFrames if split=True
     """
-    try:
-        ticker = ticker or settings.DEFAULT_MARKET
-        logger.info(f"Getting historical data for {ticker} ({days} days)")
+    ticker = ticker or settings.DEFAULT_MARKET
+    
+    # 최소 필요 일수 계산 (split=True인 경우 train+validation+test 일수)
+    min_required_days = days
+    if split:
+        min_required_days = max(days, train_days + validation_days + test_days)
         
-        # Check if we have recent data cached
-        cache_path = f"data_storage/ohlcv/{ticker}_day_{datetime.now().strftime('%Y%m%d')}.csv"
-        if os.path.exists(cache_path):
-            logger.info(f"Using cached data from {cache_path}")
-            df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-            if len(df) >= days:
-                df = df.tail(days)
-                if indicators:
-                    df = add_indicators(df)
-                
-                # If splitting is requested, split and return the data
-                if split:
-                    data_splits = _split_data(df, train_days, validation_days, test_days)
-                    
-                    # Extend with synthetic data if requested
-                    if extend_with_synthetic:
-                        try:
-                            from data.processors import extend_with_synthetic_data
-                            data_splits['train'] = extend_with_synthetic_data(data_splits['train'])
-                            logger.info(f"Extended training data with synthetic samples. New size: {len(data_splits['train'])}")
-                        except (ImportError, AttributeError) as e:
-                            logger.error(f"합성 데이터 확장 중 오류 발생: {e}")
-                            logger.warning("data.processors 모듈이나 extend_with_synthetic_data 함수를 찾을 수 없습니다. 합성 데이터 확장을 건너뜁니다.")
-                    # Train models if requested
-                    if train_models:
-                        _train_models_with_data(data_splits, ticker)
-                        
-                    return data_splits
-                return df
+    if verbose:
+        logger.info(f"Getting {min_required_days} days of historical data for {ticker} from {source}")
+    
+    df = None
+    
+    # 데이터 소스에 따른 처리
+    if source.lower() == "upbit":
+        # Upbit API에서 데이터 가져오기
+        collector = UpbitDataCollector()
+        df = collector.get_daily_ohlcv(ticker=ticker, since=None, to=None)
         
-        # Get data based on source
-        if source.lower() == "upbit":
-            total_days_needed = days
-            if split:
-                total_days_needed = max(days, train_days + validation_days + test_days)
-            
-            # Use get_ohlcv_from instead of get_ohlcv for better date range handling
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=total_days_needed)
-            
-            ohlcv = pyupbit.get_ohlcv_from(ticker=ticker, interval="day", fromDatetime=start_date, to=end_date)
-            if ohlcv is None or ohlcv.empty:
-                logger.warning(f"No OHLCV data returned for {ticker} (day)")
-                logger.error(f"데이터를 가져오지 못했습니다: {ticker}")
-                return None
-                
-            # Save the data for caching
-            save_ohlcv_data(ohlcv, ticker, "day")
-            logger.info(f"{ticker}의 일별 데이터 총 {len(ohlcv)}일 저장 완료")
-            
-            # Add indicators if requested
-            if indicators:
-                logger.info(f"일별 데이터 저장 완료: data_storage/ohlcv/{ticker}_day_{datetime.now().strftime('%Y%m%d')}.csv")
-                ohlcv = add_indicators(ohlcv)
-                from data.storage import save_indicator_data
-                save_indicator_data(ohlcv, ticker, "day")
-                logger.info(f"지표 포함 데이터 저장 완료: data_storage/processed/{ticker}/indicators/day_{datetime.now().strftime('%Y%m%d')}.csv")
-            
-            # If splitting is requested, split and return the data
-            if split:
-                data_splits = _split_data(ohlcv, train_days, validation_days, test_days)
-                
-                # Extend with synthetic data if requested
-                if extend_with_synthetic:
-                    try:
-                        from data.processors import extend_with_synthetic_data
-                        data_splits['train'] = extend_with_synthetic_data(data_splits['train'])
-                        logger.info(f"Extended training data with synthetic samples. New size: {len(data_splits['train'])}")
-                    except (ImportError, AttributeError) as e:
-                        logger.error(f"합성 데이터 확장 중 오류 발생: {e}")
-                        logger.warning("data.processors 모듈이나 extend_with_synthetic_data 함수를 찾을 수 없습니다. 합성 데이터 확장을 건너뜁니다.")
-                
-                # Train models if requested
-                if train_models:
-                    _train_models_with_data(data_splits, ticker)
-                    
-                return data_splits
-            
-            return ohlcv
-            
-        elif source.lower() == "binance":
-            # Implement Binance API integration if needed
-            logger.error("Binance API not yet implemented")
+        if df is None or df.empty:
+            logger.warning(f"No data returned from Upbit for {ticker}")
             return None
             
-        else:
-            logger.error(f"Unknown data source: {source}")
-            return None
+        # 필요 일수만큼 데이터가 충분한지 확인
+        if len(df) < min_required_days:
+            logger.warning(f"Only got {len(df)} days, need {min_required_days} days. Using available data.")
             
-    except Exception as e:
-        logger.error(f"Error in get_historical_data: {str(e)}")
-        logger.error(traceback.format_exc())
+    elif source.lower() == "file":
+        # 파일에서 데이터 읽기
+        try:
+            # 가장 최근 파일 찾기
+            pattern = f"{ticker}_day_*.csv"
+            matching_files = []
+            
+            for file in os.listdir(settings.OHLCV_DIR):
+                if file.startswith(f"{ticker}_day_") and file.endswith(".csv"):
+                    matching_files.append(os.path.join(settings.OHLCV_DIR, file))
+            
+            if not matching_files:
+                logger.warning(f"No saved data files found for {ticker}, trying Upbit API")
+                return get_historical_data(ticker, days, indicators, verbose, "upbit", 
+                                         split, train_days, validation_days, test_days)
+            
+            # 가장 최근 파일 사용
+            latest_file = max(matching_files, key=os.path.getmtime)
+            
+            if verbose:
+                logger.info(f"Loading data from file: {latest_file}")
+                
+            df = pd.read_csv(latest_file, index_col=0, parse_dates=True)
+            
+            # 필요 일수만큼 데이터가 충분한지 확인
+            if len(df) < min_required_days:
+                logger.warning(f"Saved data has only {len(df)} days, need {min_required_days} days. Using available data.")
+                
+        except Exception as e:
+            logger.error(f"Error loading data from file: {str(e)}")
+            logger.warning("Falling back to Upbit API")
+            return get_historical_data(ticker, days, indicators, verbose, "upbit", 
+                                     split, train_days, validation_days, test_days)
+    else:
+        logger.error(f"Unknown data source: {source}")
         return None
+    
+    # 중복 제거 및 정렬
+    df = df[~df.index.duplicated(keep='first')]
+    df = df.sort_index()
+    
+    # 타임스탬프 열 추가
+    df['timestamp'] = df.index
+    
+    # 필요한 일수만큼 제한
+    if len(df) > days and not split:
+        if verbose:
+            logger.info(f"Limiting to the most recent {days} days")
+        df = df.iloc[-days:]
+    
+    # 기술적 지표 추가
+    if indicators:
+        if verbose:
+            logger.info("Adding technical indicators")
+        df = add_indicators(df)
+    
+    # 데이터 저장
+    try:
+        timestamp = datetime.now().strftime('%Y%m%d')
+        filename = f"{ticker}_day_{timestamp}.csv"
+        filepath = os.path.join(settings.OHLCV_DIR, filename)
+        
+        df.to_csv(filepath)
+        
+        if verbose:
+            logger.info(f"Saved historical data to {filepath}")
+    except Exception as e:
+        logger.warning(f"Error saving historical data: {str(e)}")
+    
+    # ML을 위한 데이터 분할
+    if split:
+        if verbose:
+            logger.info(f"Splitting data for ML: train={train_days}, val={validation_days}, test={test_days}")
+        
+        data_splits = _split_data(df, train_days, validation_days, test_days)
+        
+        # 데이터 확장 옵션
+        if extend_with_synthetic and 'train' in data_splits:
+            if verbose:
+                logger.info("Extending training data with synthetic samples")
+            
+            # 확장 로직은 별도 함수로 구현 가능
+            # data_splits['train'] = extend_with_synthetic_data(data_splits['train'])
+        
+        # 모델 훈련 옵션
+        if train_models:
+            if verbose:
+                logger.info("Training models with the data")
+            _train_models_with_data(data_splits, ticker)
+        
+        return data_splits
+    
+    return df
 
 def _split_data(df: pd.DataFrame, train_days: int, validation_days: int, test_days: int) -> Dict[str, pd.DataFrame]:
     """
-    Split data into train, validation, and test sets
+    Split data into train, validation, and test sets for machine learning
     
     Args:
-        df (pd.DataFrame): Data to split
-        train_days (int): Number of days for training set
-        validation_days (int): Number of days for validation set
-        test_days (int): Number of days for test set
+        df (pd.DataFrame): DataFrame to split
+        train_days (int): Days for training set
+        validation_days (int): Days for validation set
+        test_days (int): Days for test set
         
     Returns:
-        Dict[str, pd.DataFrame]: Dictionary with train, validation, and test DataFrames
+        Dict[str, pd.DataFrame]: Dictionary with 'train', 'val', and 'test' DataFrames
     """
-    # Ensure we have enough data
-    required_days = train_days + validation_days + test_days
-    if len(df) < required_days:
-        logger.warning(f"Not enough data for splitting. Required: {required_days}, Available: {len(df)}")
-        # If not enough data, adjust the split ratios to available data
-        total = len(df)
-        train_days = int(total * (train_days / required_days))
-        validation_days = int(total * (validation_days / required_days))
-        test_days = total - train_days - validation_days
+    # 데이터가 충분한지 확인
+    total_days = train_days + validation_days + test_days
     
-    # Sort by date to ensure proper splitting
+    if len(df) < total_days:
+        logger.warning(f"Not enough data for requested split. Adjusting split sizes. {len(df)} available, {total_days} requested.")
+        
+        # 데이터 비율 유지하며 크기 조정
+        available_days = len(df)
+        total_ratio = train_days + validation_days + test_days
+        
+        train_days = int(available_days * (train_days / total_ratio))
+        validation_days = int(available_days * (validation_days / total_ratio))
+        test_days = available_days - train_days - validation_days
+        
+        logger.info(f"Adjusted split: train={train_days}, val={validation_days}, test={test_days}")
+    
+    # 데이터 정렬
     df = df.sort_index()
     
-    # Split data
-    test_start = len(df) - test_days
-    validation_start = test_start - validation_days
+    # 분할 인덱스 계산
+    test_start_idx = len(df) - test_days
+    val_start_idx = test_start_idx - validation_days
     
-    train = df.iloc[:validation_start].copy()
-    validation = df.iloc[validation_start:test_start].copy()
-    test = df.iloc[test_start:].copy()
-    
-    logger.info(f"Data split: Train={len(train)}, Validation={len(validation)}, Test={len(test)}")
-    
-    return {
-        'train': train,
-        'validation': validation,
-        'test': test
-    }
+    # 분할 실행
+    if test_start_idx > 0 and val_start_idx > 0:
+        test_df = df.iloc[test_start_idx:]
+        val_df = df.iloc[val_start_idx:test_start_idx]
+        train_df = df.iloc[:val_start_idx]
+        
+        # 각 세트에 설명 열 추가
+        train_df = train_df.copy()
+        val_df = val_df.copy()
+        test_df = test_df.copy()
+        
+        train_df['set'] = 'train'
+        val_df['set'] = 'validation'
+        test_df['set'] = 'test'
+        
+        # 결과 반환
+        return {
+            'train': train_df,
+            'val': val_df,
+            'test': test_df,
+            'all': df
+        }
+    else:
+        logger.error(f"Invalid split: train_days={train_days}, val_days={validation_days}, test_days={test_days}, data_len={len(df)}")
+        # 분할 실패 시 전체 데이터를 모든 세트에 사용
+        return {
+            'train': df.copy(),
+            'val': df.copy(),
+            'test': df.copy(),
+            'all': df
+        }
 
 def _train_models_with_data(data_splits: Dict[str, pd.DataFrame], ticker: str = "KRW-BTC") -> None:
     """
@@ -593,7 +827,7 @@ def _train_models_with_data(data_splits: Dict[str, pd.DataFrame], ticker: str = 
     try:
         from models.random_forest import RandomForestDirectionModel
         from models.gru import GRUDirectionModel
-        from models.ensemble import VotingEnsemble
+        from ensemble.ensemble_core import VotingEnsemble
         from data.processors import prepare_data_for_training
         
         logger.info("모델 훈련을 위한 데이터 준비 중...")
@@ -842,48 +1076,84 @@ def _train_models_with_data(data_splits: Dict[str, pd.DataFrame], ticker: str = 
 
 
 @log_execution
-def collect_all_required_data(ticker: str = None) -> Dict[str, pd.DataFrame]:
+def collect_all_required_data(ticker: str = None, include_hourly: bool = True, save_data: bool = True) -> Dict[str, pd.DataFrame]:
     """
-    Collect all required data for backtesting and model training
+    모델 학습과 백테스팅에 필요한 모든 데이터를 수집
     
     Args:
-        ticker (str, optional): Ticker symbol. Defaults to settings.DEFAULT_MARKET.
+        ticker (str, optional): 티커 심볼. Defaults to settings.DEFAULT_MARKET.
+        include_hourly (bool, optional): 시간별 데이터 포함 여부. Defaults to True.
+        save_data (bool, optional): 데이터를 파일로 저장할지 여부. Defaults to True.
         
     Returns:
-        Dict[str, pd.DataFrame]: Dictionary containing dataframes for daily and hourly data
+        Dict[str, pd.DataFrame]: 일별 및 시간별 데이터를 포함하는 딕셔너리
     """
     ticker = ticker or settings.DEFAULT_MARKET
     result = {}
     
-    # Get daily data for as long as possible (up to 1000 days)
-    daily_data = get_historical_data(ticker=ticker)
+    # 일별 데이터 수집 (최대 1000일)
+    logger.info(f"일별 데이터 수집 중: {ticker}")
+    daily_data = get_historical_data(
+        ticker=ticker, 
+        days=1000,
+        indicators=True,
+        verbose=True,
+        source="upbit"
+    )
+    
     if daily_data is not None:
         result['daily'] = daily_data
-        logger.info(f"Collected {len(daily_data)} days of daily data for {ticker}")
+        logger.info(f"{ticker}의 일별 데이터 {len(daily_data)}일 수집 완료")
+        
+        # 파일로 이미 저장되었으므로 추가 저장 불필요
     else:
-        logger.warning(f"Failed to collect daily data for {ticker}")
+        logger.warning(f"{ticker}의 일별 데이터 수집 실패")
     
-    # Get hourly data (up to 2000 hours = ~83 days)
-    hourly_data = upbit_collector.get_hourly_ohlcv(ticker=ticker)
-    if hourly_data is not None:
-        result['hourly'] = hourly_data
-        logger.info(f"Collected {len(hourly_data)} hours of hourly data for {ticker}")
-        
-        # 시간별 데이터 저장
-        from data.storage import save_ohlcv_data
-        save_path = save_ohlcv_data(hourly_data, ticker, 'hour')
-        logger.info(f"시간별 데이터가 {save_path}에 저장되었습니다.")
-        
-        # 지표가 있는 경우 지표 추가
-        if len(hourly_data) >= 100:
-            from data.indicators import calculate_all_indicators
-            hourly_data_with_indicators = calculate_all_indicators(hourly_data, timeframe='hour')
+    # 시간별 데이터 수집 (선택 사항)
+    if include_hourly:
+        logger.info(f"시간별 데이터 수집 중: {ticker}")
+        try:
+            collector = UpbitDataCollector()
+            hourly_data = collector.get_hourly_ohlcv(ticker=ticker, count=2000)  # 약 83일
             
-            # 지표가 추가된 시간별 데이터 저장
-            from data.storage import save_processed_data
-            save_path = save_processed_data(hourly_data_with_indicators, ticker, 'indicators', 'hour')
-            logger.info(f"지표가 추가된 시간별 데이터가 {save_path}에 저장되었습니다.")
-    else:
-        logger.warning(f"Failed to collect hourly data for {ticker}")
+            if hourly_data is not None and not hourly_data.empty:
+                result['hourly'] = hourly_data
+                logger.info(f"{ticker}의 시간별 데이터 {len(hourly_data)}시간 수집 완료")
+                
+                # 시간별 데이터 저장
+                if save_data:
+                    try:
+                        # 시간별 데이터 저장
+                        timestamp = datetime.now().strftime('%Y%m%d')
+                        filename = f"{ticker}_hour_{timestamp}.csv"
+                        filepath = os.path.join(settings.OHLCV_DIR, filename)
+                        
+                        hourly_data.to_csv(filepath)
+                        logger.info(f"시간별 데이터 저장 완료: {filepath}")
+                        
+                        # 기술적 지표 추가
+                        if len(hourly_data) >= 100:
+                            hourly_data_with_indicators = add_indicators(hourly_data)
+                            
+                            # 지표 데이터 저장
+                            indicators_dir = os.path.join(settings.PROCESSED_DIR, ticker, "indicators")
+                            os.makedirs(indicators_dir, exist_ok=True)
+                            
+                            indicator_filepath = os.path.join(
+                                indicators_dir, 
+                                f"hour_{timestamp}.csv"
+                            )
+                            hourly_data_with_indicators.to_csv(indicator_filepath)
+                            logger.info(f"지표 포함 시간별 데이터 저장 완료: {indicator_filepath}")
+                            
+                            # 지표 포함 데이터로 업데이트
+                            result['hourly'] = hourly_data_with_indicators
+                    except Exception as e:
+                        logger.error(f"시간별 데이터 저장 중 오류: {str(e)}")
+            else:
+                logger.warning(f"{ticker}의 시간별 데이터 수집 실패")
+        except Exception as e:
+            logger.error(f"시간별 데이터 수집 중 오류: {str(e)}")
+            logger.debug(traceback.format_exc())
     
     return result 

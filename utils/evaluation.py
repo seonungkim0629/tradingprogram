@@ -890,27 +890,69 @@ def analyze_market_correlation(
             'error': '전략 수익률과 시장 수익률의 데이터 길이가 일치하지 않거나 데이터가 없습니다.'
         }
     
-    # 상관계수 계산
-    correlation = np.corrcoef(strategy_returns, market_returns)[0, 1]
+    # 데이터 유효성 체크
+    strategy_returns_clean = np.array(strategy_returns)
+    market_returns_clean = np.array(market_returns)
+    
+    # NaN 값 제거
+    valid_indices = ~(np.isnan(strategy_returns_clean) | np.isnan(market_returns_clean))
+    strategy_returns_clean = strategy_returns_clean[valid_indices]
+    market_returns_clean = market_returns_clean[valid_indices]
+    
+    # 데이터 값이 초기화되었는지 재확인
+    if len(strategy_returns_clean) < 2 or len(market_returns_clean) < 2:
+        return {
+            'correlation': 0.0,
+            'beta': 0.0,
+            'alpha': 0.0,
+            'excess_return': 0.0,
+            'market_cumulative_return': 0.0,
+            'strategy_cumulative_return': 0.0,
+            'outperformance': 0.0
+        }
+    
+    # 표준 편차 검사
+    strategy_std = np.std(strategy_returns_clean)
+    market_std = np.std(market_returns_clean)
+    
+    # 상관계수 계산 - 표준 편차가 0인 경우 포함한 주의 처리
+    if strategy_std == 0 or market_std == 0:
+        correlation = 0.0  # 표준 편차가 0이면 상관관계도 0
+    else:
+        try:
+            # 수동 상관계수 계산
+            mean_strategy = np.mean(strategy_returns_clean)
+            mean_market = np.mean(market_returns_clean)
+            
+            numerator = np.sum((strategy_returns_clean - mean_strategy) * (market_returns_clean - mean_market))
+            denominator = strategy_std * market_std * len(strategy_returns_clean)
+            
+            if denominator == 0:
+                correlation = 0.0
+            else:
+                correlation = numerator / denominator
+        except Exception as e:
+            logger.warning(f"상관계수 계산 오류: {str(e)}")
+            correlation = 0.0
     
     # 베타 계산 (시장 변동성 대비 전략 변동성)
-    market_variance = np.var(market_returns)
+    market_variance = np.var(market_returns_clean)
     if market_variance == 0:
         beta = 0
     else:
-        beta = correlation * (np.std(strategy_returns) / np.std(market_returns))
+        beta = correlation * (strategy_std / market_std)
     
     # 알파 계산 (CAPM 모델 기반)
     risk_free_rate = 0.02 / 365  # 일별 무위험 수익률 (2% 연간)
-    expected_return = risk_free_rate + beta * (np.mean(market_returns) - risk_free_rate)
-    alpha = np.mean(strategy_returns) - expected_return
+    expected_return = risk_free_rate + beta * (np.mean(market_returns_clean) - risk_free_rate)
+    alpha = np.mean(strategy_returns_clean) - expected_return
     
     # 시장 대비 초과 수익률
-    excess_return = np.mean(strategy_returns) - np.mean(market_returns)
+    excess_return = np.mean(strategy_returns_clean) - np.mean(market_returns_clean)
     
     # 지수화된 시장 및 전략 누적 수익률
-    market_cumulative = (1 + np.array(market_returns)).cumprod()[-1] - 1
-    strategy_cumulative = (1 + np.array(strategy_returns)).cumprod()[-1] - 1
+    market_cumulative = (1 + np.array(market_returns_clean)).cumprod()[-1] - 1
+    strategy_cumulative = (1 + np.array(strategy_returns_clean)).cumprod()[-1] - 1
     
     return {
         'correlation': correlation,
@@ -920,4 +962,77 @@ def analyze_market_correlation(
         'market_cumulative_return': market_cumulative,
         'strategy_cumulative_return': strategy_cumulative,
         'outperformance': strategy_cumulative - market_cumulative
+    }
+
+def calculate_profit_metrics(trades: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    거래 목록에서 수익률 지표 계산
+    
+    Args:
+        trades (List[Dict[str, Any]]): 거래 목록
+        
+    Returns:
+        Dict[str, float]: 수익률 지표
+    """
+    if not trades:
+        return {
+            'total_profit': 0,
+            'total_returns': 0,  # profit_percentage에서 returns로 변경
+            'win_rate': 0,
+            'profit_factor': 0,
+            'avg_profit': 0,
+            'avg_loss': 0,
+            'max_profit': 0,
+            'max_loss': 0,
+            'avg_hold_time': 0
+        }
+    
+    # 수익 거래와 손실 거래 분리
+    profit_trades = [t for t in trades if t.get('profit_loss', 0) > 0]
+    loss_trades = [t for t in trades if t.get('profit_loss', 0) <= 0]
+    
+    # 총 수익 및 손실 계산
+    total_profit = sum(t.get('profit_loss', 0) for t in profit_trades)
+    total_loss = abs(sum(t.get('profit_loss', 0) for t in loss_trades))
+    
+    # 수익률 지표 계산
+    profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
+    win_rate = len(profit_trades) / len(trades) if trades else 0
+    
+    # 평균 수익 및 손실
+    avg_profit = total_profit / len(profit_trades) if profit_trades else 0
+    avg_loss = total_loss / len(loss_trades) if loss_trades else 0
+    
+    # 최대 수익 및 손실
+    max_profit = max([t.get('profit_loss', 0) for t in profit_trades], default=0)
+    max_loss = min([t.get('profit_loss', 0) for t in loss_trades], default=0)
+    
+    # 평균 보유 기간 (거래 간 시간 간격)
+    hold_times = []
+    for i in range(len(trades)):
+        if i > 0 and trades[i].get('type') == 'SELL' and trades[i-1].get('type') == 'BUY':
+            try:
+                buy_time = datetime.fromisoformat(trades[i-1].get('timestamp', ''))
+                sell_time = datetime.fromisoformat(trades[i].get('timestamp', ''))
+                hold_time = (sell_time - buy_time).total_seconds() / 86400  # 일 단위로 변환
+                hold_times.append(hold_time)
+            except (ValueError, TypeError):
+                pass
+    
+    avg_hold_time = sum(hold_times) / len(hold_times) if hold_times else 0
+    
+    # 거래당 평균 수익률 계산
+    avg_return_per_trade = sum(t.get('returns', 0) for t in trades) / len(trades) if trades else 0  # profit_pct에서 returns로 변경
+    
+    return {
+        'total_profit': total_profit,
+        'total_returns': total_profit / trades[0].get('balance_after', 1),  # profit_percentage에서 returns로 변경
+        'win_rate': win_rate,
+        'profit_factor': profit_factor,
+        'avg_profit': avg_profit,
+        'avg_loss': avg_loss,
+        'max_profit': max_profit,
+        'max_loss': max_loss,
+        'avg_hold_time': avg_hold_time,
+        'avg_return_per_trade': avg_return_per_trade  # profit_pct에서 returns_per_trade로 변경
     } 

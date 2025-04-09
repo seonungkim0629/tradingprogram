@@ -23,6 +23,7 @@ from config import settings
 from utils.logging import get_logger, log_execution
 from data.indicators import calculate_all_indicators, filter_indicators
 from data.preprocessors import add_target_variable
+from utils.data_utils import clean_dataframe
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -365,9 +366,13 @@ def _normalize_single_column(df: pd.DataFrame, col: str, scaler_dict: Dict = Non
 def extend_with_synthetic_data(df: pd.DataFrame, target_days: int = 1000, 
                              balanced_direction: bool = True) -> pd.DataFrame:
     """
-    원본 데이터가 부족할 경우 합성 데이터를 추가하여 확장
+    실제 데이터를 기반으로 합성 데이터를 생성하여 데이터셋을 확장
     
     Args:
+        df (pd.DataFrame): 원본 데이터프레임
+        target_days (int, optional): 목표 데이터 일수. Defaults to 1000.
+        balanced_direction (bool, optional): 방향성(상승/하락) 균형 유지 여부. Defaults to True.
+        
         df (pd.DataFrame): 원본 OHLCV 데이터
         target_days (int): 목표 데이터 일수
         balanced_direction (bool): 상승/하락 비율을 균형 있게 할지 여부
@@ -683,47 +688,43 @@ def extend_with_synthetic_data(df: pd.DataFrame, target_days: int = 1000,
 def split_historical_data(df: pd.DataFrame, train_days: int = 650, 
                          validation_days: int = 150, test_days: int = 200) -> Dict[str, pd.DataFrame]:
     """
-    Split historical data into training, validation, and test sets based on days
+    과거 시장 데이터를 훈련, 검증, 테스트 세트로 분할
     
     Args:
-        df (pd.DataFrame): OHLCV DataFrame with datetime index
-        train_days (int): Number of days for training set
-        validation_days (int): Number of days for validation set
-        test_days (int): Number of days for test set
+        df (pd.DataFrame): 원본 데이터프레임
+        train_days (int, optional): 훈련 세트 일수. Defaults to 650.
+        validation_days (int, optional): 검증 세트 일수. Defaults to 150.
+        test_days (int, optional): 테스트 세트 일수. Defaults to 200.
         
     Returns:
-        Dict[str, pd.DataFrame]: Dictionary with 'train', 'validation', and 'test' DataFrames
+        Dict[str, pd.DataFrame]: 'train', 'validation', 'test', 'all' 키를 가진 딕셔너리
     """
-    # Ensure the dataframe is sorted by date
+    from utils.data_utils import clean_dataframe
+    
+    # 데이터 정리
+    df = clean_dataframe(df, handle_missing='interpolate')
+    
+    # 타임스탬프 형식 확인
+    if not isinstance(df.index, pd.DatetimeIndex):
+        try:
+            if 'timestamp' in df.columns:
+                df.set_index('timestamp', inplace=True)
+            else:
+                df.index = pd.to_datetime(df.index)
+            logger.info("인덱스를 DatetimeIndex로 변환했습니다.")
+        except Exception as e:
+            logger.warning(f"인덱스 변환 실패: {str(e)}. 원본 인덱스를 유지합니다.")
+    
+    # 데이터 정렬
     df = df.sort_index()
     
-    # Calculate total required days
-    total_days = train_days + validation_days + test_days
+    # 사용 가능한 총 데이터 일수
     total_available = len(df)
-    
-    # 데이터가 하나도 없는 경우 처리
-    if total_available == 0:
-        logger.warning("No data available for splitting")
-        empty_df = pd.DataFrame(columns=df.columns if not df.empty else ['open', 'high', 'low', 'close', 'volume', 'value'])
-        return {
-            'train': empty_df.copy(),
-            'validation': empty_df.copy(),
-            'test': empty_df.copy()
-        }
-    
-    # 너무 적은 데이터 처리 (최소 3일 필요)
-    if total_available < 3:
-        logger.warning(f"Only {total_available} days available, minimum 3 days required")
-        # 데이터를 복제하여 각 세트에 최소 1일씩 할당
-        return {
-            'train': df.iloc[0:1].copy() if total_available > 0 else pd.DataFrame(columns=df.columns),
-            'validation': df.iloc[0:1].copy() if total_available > 0 else pd.DataFrame(columns=df.columns),
-            'test': df.iloc[-1:].copy() if total_available > 0 else pd.DataFrame(columns=df.columns)
-        }
+    total_days = train_days + validation_days + test_days
     
     # 충분한 데이터가 없는 경우 비율에 맞게 조정
     if total_available < total_days:
-        logger.warning(f"Not enough data for specified split. Have {total_available} days, need {total_days} days.")
+        logger.warning(f"지정된 분할에 충분한 데이터가 없습니다. 보유: {total_available}일, 필요: {total_days}일.")
         
         # 최소 테스트 세트 크기 보장 (적어도 1일)
         min_test_days = max(1, int(total_available * 0.1))
@@ -736,7 +737,7 @@ def split_historical_data(df: pd.DataFrame, train_days: int = 650,
         val_size = max(1, remaining_days - train_size)
         test_size = min_test_days
         
-        logger.info(f"Adjusted split: Train={train_size}, Val={val_size}, Test={test_size} days")
+        logger.info(f"조정된 분할: 훈련={train_size}, 검증={val_size}, 테스트={test_size}일")
     else:
         # 충분한 데이터가 있는 경우
         train_size = train_days
@@ -790,27 +791,30 @@ def split_historical_data(df: pd.DataFrame, train_days: int = 650,
     
     # 빈 데이터프레임 검사 및 처리
     if train_data.empty and total_available > 0:
-        logger.warning("Train data is empty, allocating at least one sample")
+        logger.warning("훈련 데이터가 비어 있습니다. 최소 1개 샘플을 할당합니다.")
         train_data = df.iloc[0:1].copy()
     
     if val_data.empty and total_available > 1:
-        logger.warning("Validation data is empty, allocating at least one sample")
+        logger.warning("검증 데이터가 비어 있습니다. 최소 1개 샘플을 할당합니다.")
         # 이미 훈련 데이터가 있다면 다른 샘플 사용
         if len(train_data) < total_available:
             val_data = df.iloc[len(train_data):len(train_data)+1].copy()
         else:
             val_data = df.iloc[0:1].copy()
     
-    if test_data.empty and total_available > 0:
-        logger.warning("Test data is empty, allocating at least one sample")
-        test_data = df.iloc[-1:].copy()
+    # 데이터 세트에 식별자 추가
+    train_data['set'] = 'train'
+    val_data['set'] = 'validation'
+    test_data['set'] = 'test'
     
-    logger.info(f"Data split complete: Train={len(train_data)}, Val={len(val_data)}, Test={len(test_data)} days")
+    # 데이터셋 크기 로깅
+    logger.info(f"데이터 분할 완료: 훈련={len(train_data)}일, 검증={len(val_data)}일, 테스트={len(test_data)}일")
     
     return {
         'train': train_data,
         'validation': val_data,
-        'test': test_data
+        'test': test_data,
+        'all': df
     }
 
 @log_execution
@@ -1701,3 +1705,45 @@ class DataProcessor:
             logger.error(f"기술적 지표 추가 중 오류 발생: {str(e)}")
             logger.error(traceback.format_exc())
             return data
+
+def filter_indicators(df: pd.DataFrame, indicator_list: List[str] = None) -> pd.DataFrame:
+    """
+    필터링된 지표들만 포함하는 데이터프레임을 반환합니다.
+    
+    Args:
+        df (pd.DataFrame): 모든 지표가 포함된 데이터프레임
+        indicator_list (List[str], optional): 유지할 지표 리스트. None이면 기본 지표 사용.
+        
+    Returns:
+        pd.DataFrame: 필터링된 지표들만 포함하는 데이터프레임
+    """
+    try:
+        if indicator_list is None:
+            # 기본 주요 지표 목록
+            indicator_list = [
+                'open', 'high', 'low', 'close', 'volume',  # 기본 OHLCV
+                'sma7', 'sma25', 'ema12', 'ema26', 'ema200',  # 이동평균
+                'macd', 'macd_signal', 'macd_diff',  # MACD
+                'rsi14',  # RSI
+                'bb_upper', 'bb_middle', 'bb_lower',  # 볼린저 밴드
+                'stoch_k', 'stoch_d',  # 스토캐스틱
+                'atr', 'obv',  # 기타 인기 지표
+                'daily_return'  # 수익률
+            ]
+        
+        # 실제 데이터프레임에 존재하는 컬럼만 필터링
+        available_columns = [col for col in indicator_list if col in df.columns]
+        
+        if len(available_columns) < len(indicator_list):
+            missing_columns = set(indicator_list) - set(available_columns)
+            logger.warning(f"일부 요청된 지표가 데이터프레임에 없습니다: {missing_columns}")
+        
+        # 필터링된 데이터프레임 반환
+        return df[available_columns].copy()
+    
+    except Exception as e:
+        logger.error(f"지표 필터링 중 오류 발생: {str(e)}")
+        # 기본 OHLCV 컬럼만 반환 (최소한의 안전망)
+        basic_cols = ['open', 'high', 'low', 'close', 'volume']
+        available_basic = [col for col in basic_cols if col in df.columns]
+        return df[available_basic].copy()

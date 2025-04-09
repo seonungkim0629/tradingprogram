@@ -10,9 +10,13 @@ import os
 import json
 import logging
 import pandas as pd
-# 로거 설정
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+from utils.constants import TimeFrame, SignalType
+from utils.logging import get_logger
+from utils.data_converters import convert_signal_format
+from models.signal import TradingSignal, standardize_signal
+
+# Initialize logger
+logger = get_logger(__name__)
 
 # 파일 핸들러 추가
 if not logger.handlers:
@@ -23,7 +27,7 @@ if not logger.handlers:
     logger.addHandler(fh)
 
 class BaseStrategy(ABC):
-    """Abstract base class for all trading strategies"""
+    """Base class for all trading strategies"""
     
     def __init__(self, 
                 market: str = "KRW-BTC",
@@ -46,15 +50,16 @@ class BaseStrategy(ABC):
         self.logger.info(f"Initialized {self.name} strategy for {market}")
     
     @abstractmethod
-    def generate_signal(self, data: pd.DataFrame) -> Dict[str, Any]:
+    def generate_signal(self, data: Union[pd.DataFrame, Dict[str, pd.DataFrame]]) -> Union[Dict[str, Any], 'TradingSignal']:
         """
         Generate trading signal based on market data
         
         Args:
-            data (pd.DataFrame): Market data with OHLCV and indicators
+            data (Union[pd.DataFrame, Dict[str, pd.DataFrame]]): Market data with OHLCV and indicators,
+                either a single DataFrame or a dictionary of DataFrames for different timeframes
             
         Returns:
-            Dict[str, Any]: Signal dictionary with keys:
+            Union[Dict[str, Any], TradingSignal]: Signal dictionary or TradingSignal object with:
                 - signal (str): 'BUY', 'SELL', or 'HOLD'
                 - reason (str): Reason for the signal
                 - confidence (float): Signal confidence (0.0-1.0)
@@ -81,55 +86,56 @@ class BaseStrategy(ABC):
         """
         return self.hourly_data
     
-    @abstractmethod
-    def generate_signal(self, data: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Generate trading signal based on market data
-        
-        Args:
-            data (pd.DataFrame): Market data with OHLCV and indicators
-            
-        Returns:
-            Dict[str, Any]: Signal dictionary with keys:
-                - signal (str): 'BUY', 'SELL', or 'HOLD'
-                - reason (str): Reason for the signal
-                - confidence (float): Signal confidence (0.0-1.0)
-                - metadata (Dict): Additional signal metadata
-        """
-        pass
-    
     def apply_risk_management(self, 
-                            signal: Dict[str, Any], 
-                            portfolio: Dict[str, Any]) -> Dict[str, Any]:
+                            signal: Union[Dict[str, Any], 'TradingSignal'], 
+                            portfolio: Dict[str, Any]) -> Union[Dict[str, Any], 'TradingSignal']:
         """
         Apply risk management to the generated signal
         
         Args:
-            signal (Dict[str, Any]): Generated signal
+            signal (Union[Dict[str, Any], 'TradingSignal']): Generated signal
             portfolio (Dict[str, Any]): Current portfolio state
             
         Returns:
-            Dict[str, Any]: Modified signal with risk management applied
+            Union[Dict[str, Any], 'TradingSignal']: Modified signal with risk management applied
         """
         # Default implementation just passes through the signal
         # Subclasses can override to implement risk management
-        return signal
+        
+        # 입력 신호 타입 확인
+        is_dict_input = isinstance(signal, dict)
+        
+        # 신호를 TradingSignal 객체로 표준화
+        std_signal = standardize_signal(signal)
+        
+        # 여기서 리스크 관리 로직 적용 (기본 구현은 없음)
+        
+        # 원래 형식으로 반환
+        if is_dict_input:
+            return std_signal.to_dict()
+        else:
+            return std_signal
     
     def calculate_position_size(self, 
-                               signal: Dict[str, Any], 
-                               available_balance: float) -> float:
+                              signal: Union[Dict[str, Any], 'TradingSignal'], 
+                              available_balance: float) -> float:
         """
         Calculate position size for a trade
         
         Args:
-            signal (Dict[str, Any]): Generated signal
+            signal (Union[Dict[str, Any], 'TradingSignal']): Generated signal
             available_balance (float): Available balance for trading
             
         Returns:
             float: Position size in base currency
         """
+        from models.signal import standardize_signal
+        
+        # 신호를 TradingSignal 객체로 표준화
+        std_signal = standardize_signal(signal)
+        
         # Default implementation: use position sizing from signal or full balance
-        position_size = signal.get("position_size", 1.0)  # Default to 100%
+        position_size = std_signal.position_size if hasattr(std_signal, 'position_size') else 1.0
         
         # If position_size is a percentage (0.0-1.0), convert to absolute value
         if 0.0 <= position_size <= 1.0:

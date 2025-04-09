@@ -16,9 +16,12 @@ import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
 import matplotlib.pyplot as plt
 import openai
+import traceback
 
 from models.base import GPTAnalysisModel
 from utils.logging import get_logger
+from utils.constants import SignalType
+from models.signal import TradingSignal, ModelOutput
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -723,4 +726,135 @@ class GPTMarketAnalyzer(GPTAnalysisModel):
         plt.grid(True)
         
         plt.tight_layout()
-        plt.show() 
+        plt.show()
+    
+    def predict(self, X: np.ndarray, **kwargs) -> ModelOutput:
+        """
+        Predict using GPT Market Analysis
+        
+        Args:
+            X (np.ndarray): Input data (market data in numpy format)
+            **kwargs: Additional parameters
+                market_data (pd.DataFrame): Market OHLCV data
+                indicators (Optional[pd.DataFrame]): Technical indicators
+                sentiment_data (Optional[Dict[str, Any]]): Market sentiment data
+                news_data (Optional[List[Dict[str, str]]]): News data
+            
+        Returns:
+            ModelOutput: Standardized model output containing prediction results
+        """
+        # Check if we have a dataframe in kwargs
+        market_data = kwargs.get('market_data')
+        
+        # If no market_data in kwargs, try to convert X to DataFrame
+        if market_data is None:
+            if isinstance(X, np.ndarray):
+                try:
+                    # Assume X is an OHLCV array
+                    columns = ['open', 'high', 'low', 'close', 'volume']
+                    if X.shape[1] < len(columns):
+                        columns = columns[:X.shape[1]]
+                    
+                    market_data = pd.DataFrame(X, columns=columns)
+                    
+                    # Add timestamps if not present
+                    if 'timestamp' not in market_data.columns:
+                        end_date = datetime.now()
+                        start_date = end_date - pd.Timedelta(days=len(market_data))
+                        market_data['timestamp'] = pd.date_range(start=start_date, end=end_date, periods=len(market_data))
+                        
+                except Exception as e:
+                    self.logger.error(f"Failed to convert X to DataFrame: {str(e)}")
+                    return ModelOutput(
+                        signal=TradingSignal(
+                            signal_type=SignalType.HOLD,
+                            confidence=0.0,
+                            reason=f"Failed to convert input data: {str(e)}"
+                        ),
+                        confidence=0.0,
+                        metadata={"error": str(e)}
+                    )
+            else:
+                return ModelOutput(
+                    signal=TradingSignal(
+                        signal_type=SignalType.HOLD,
+                        confidence=0.0,
+                        reason="Input data format not supported"
+                    ),
+                    confidence=0.0,
+                    metadata={"error": "Input data format not supported"}
+                )
+        
+        # Extract other parameters from kwargs
+        indicators = kwargs.get('indicators')
+        sentiment_data = kwargs.get('sentiment_data')
+        news_data = kwargs.get('news_data')
+        
+        try:
+            # Call analyze_market
+            analysis = self.analyze_market(
+                market_data=market_data,
+                indicators=indicators,
+                sentiment_data=sentiment_data,
+                news_data=news_data,
+                **kwargs
+            )
+            
+            # Extract market prediction
+            prediction = analysis.get('prediction', {})
+            direction = prediction.get('direction', 'sideways')
+            confidence_text = prediction.get('confidence', 'medium')
+            
+            # Convert text confidence to numeric value
+            confidence_map = {'low': 0.3, 'medium': 0.6, 'high': 0.9}
+            confidence = confidence_map.get(confidence_text.lower(), 0.5)
+            
+            # Convert direction to signal type
+            signal_type = SignalType.HOLD
+            if direction.lower() == 'up':
+                signal_type = SignalType.BUY
+            elif direction.lower() == 'down':
+                signal_type = SignalType.SELL
+            
+            # Create TradingSignal
+            signal = TradingSignal(
+                signal_type=signal_type,
+                confidence=confidence,
+                reason=analysis.get('analysis', 'GPT market analysis'),
+                metadata={
+                    "market_condition": analysis.get('market_condition'),
+                    "current_trend": analysis.get('current_trend'),
+                    "key_levels": analysis.get('key_levels'),
+                    "patterns": analysis.get('patterns'),
+                    "expected_range": prediction.get('expected_range'),
+                    "trade_recommendation": analysis.get('trade_recommendation'),
+                    "risk_assessment": analysis.get('risk_assessment')
+                }
+            )
+            
+            # Create ModelOutput
+            return ModelOutput(
+                signal=signal,
+                confidence=confidence,
+                metadata={
+                    "model_name": self.name,
+                    "model_type": self.model_type,
+                    "analysis_time": datetime.now().isoformat(),
+                    "gpt_model": self.gpt_model,
+                    "full_analysis": analysis
+                }
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in GPT market prediction: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            
+            return ModelOutput(
+                signal=TradingSignal(
+                    signal_type=SignalType.HOLD,
+                    confidence=0.0,
+                    reason=f"GPT analysis error: {str(e)}"
+                ),
+                confidence=0.0,
+                metadata={"error": str(e), "traceback": traceback.format_exc()}
+            ) 
